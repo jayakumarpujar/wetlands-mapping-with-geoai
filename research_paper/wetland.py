@@ -368,20 +368,45 @@ def download_naip_timeseries(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    max_retries = kwargs.pop("max_retries", 3)
+
     results: Dict[int, List[str]] = {}
     for year in years:
         year_dir = str(output_dir / str(year))
-        logger.info("Downloading NAIP for year %d to %s", year, year_dir)
-        files = download_naip(
-            bbox=bbox,
-            output_dir=year_dir,
-            year=year,
-            max_items=max_items_per_year,
-            overwrite=overwrite,
-            **kwargs,
-        )
-        if files:
-            results[year] = files
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Downloading NAIP for year %d (attempt %d/%d) to %s",
+                    year, attempt, max_retries, year_dir,
+                )
+                files = download_naip(
+                    bbox=bbox,
+                    output_dir=year_dir,
+                    year=year,
+                    max_items=max_items_per_year,
+                    overwrite=overwrite,
+                    **kwargs,
+                )
+                if files:
+                    results[year] = files
+                break
+            except (TimeoutError, OSError, ConnectionError) as exc:
+                last_error = exc
+                logger.warning(
+                    "NAIP download for year %d attempt %d/%d failed: %s",
+                    year, attempt, max_retries, exc,
+                )
+                if attempt < max_retries:
+                    import time
+                    wait = min(30, 5 * attempt)
+                    logger.info("Retrying in %ds ...", wait)
+                    time.sleep(wait)
+        else:
+            raise TimeoutError(
+                f"NAIP download for year {year} failed after "
+                f"{max_retries} attempts"
+            ) from last_error
 
     return results
 
@@ -424,7 +449,36 @@ def download_3dep_dem(
 
     import py3dep
 
-    dem = py3dep.get_dem(bbox, resolution=resolution, crs="EPSG:4326")
+    max_retries = kwargs.get("max_retries", 3)
+    timeout = kwargs.get("timeout", 120)
+
+    # Set timeout for the underlying async_retriever / pygeoogc calls
+    os.environ.setdefault("HYRIVER_CACHE_DISABLE", "true")
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(
+                "3DEP download attempt %d/%d (timeout=%ds) ...",
+                attempt, max_retries, timeout,
+            )
+            dem = py3dep.get_dem(bbox, resolution=resolution, crs="EPSG:4326")
+            break
+        except (TimeoutError, OSError, ConnectionError) as exc:
+            last_error = exc
+            logger.warning(
+                "3DEP download attempt %d/%d failed: %s",
+                attempt, max_retries, exc,
+            )
+            if attempt < max_retries:
+                import time
+                wait = min(30, 5 * attempt)
+                logger.info("Retrying in %ds ...", wait)
+                time.sleep(wait)
+    else:
+        raise TimeoutError(
+            f"3DEP DEM download failed after {max_retries} attempts"
+        ) from last_error
 
     dem.rio.to_raster(str(output_path))
     logger.info("Saved 3DEP DEM (%dm) to %s", resolution, output_path)
@@ -482,9 +536,36 @@ def download_nwi(
         "resultRecordCount": 10000,
     }
 
-    logger.info("Querying NWI for bbox %s", bbox)
-    resp = requests.get(url, params=params, timeout=120)
-    resp.raise_for_status()
+    max_retries = kwargs.get("max_retries", 3)
+    timeout = kwargs.get("timeout", 120)
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(
+                "Querying NWI for bbox %s (attempt %d/%d) ...",
+                bbox, attempt, max_retries,
+            )
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            break
+        except (TimeoutError, OSError, ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            logger.warning(
+                "NWI download attempt %d/%d failed: %s",
+                attempt, max_retries, exc,
+            )
+            if attempt < max_retries:
+                import time
+                wait = min(30, 5 * attempt)
+                logger.info("Retrying in %ds ...", wait)
+                time.sleep(wait)
+    else:
+        raise TimeoutError(
+            f"NWI download failed after {max_retries} attempts"
+        ) from last_error
 
     gdf = gpd.GeoDataFrame.from_features(resp.json()["features"], crs="EPSG:4326")
     gdf.to_file(str(output_path), driver="GPKG")
