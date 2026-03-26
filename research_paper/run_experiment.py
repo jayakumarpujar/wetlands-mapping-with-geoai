@@ -58,11 +58,18 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
     bbox = config["study_area"]["bbox"]
     years = config["study_area"]["naip_years"]
 
+    # Retry settings from overrides (useful for flaky Colab networks)
+    retry_kwargs = {
+        "max_retries": config["training"].get("download_max_retries", 5),
+        "timeout": config["training"].get("download_timeout", 300),
+    }
+
     logger.info("Downloading NAIP timeseries for years %s ...", years)
     naip_files = download_naip_timeseries(
         bbox=bbox,
         output_dir=paths["naip_dir"],
         years=years,
+        **retry_kwargs,
     )
 
     logger.info("Downloading 3DEP DEM ...")
@@ -70,12 +77,14 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
         bbox=bbox,
         output_path=paths["dem_path"],
         resolution=config["training"].get("dem_resolution", 1),
+        **retry_kwargs,
     )
 
     logger.info("Downloading NWI ...")
     nwi_path = download_nwi(
         bbox=bbox,
         output_path=paths["nwi_path"],
+        **retry_kwargs,
     )
 
     return {

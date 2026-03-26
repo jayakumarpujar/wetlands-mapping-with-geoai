@@ -449,35 +449,62 @@ def download_3dep_dem(
 
     import py3dep
 
-    max_retries = kwargs.get("max_retries", 3)
-    timeout = kwargs.get("timeout", 120)
+    max_retries = kwargs.get("max_retries", 5)
+    timeout = kwargs.get("timeout", 300)
 
     # Set timeout for the underlying async_retriever / pygeoogc calls
     os.environ.setdefault("HYRIVER_CACHE_DISABLE", "true")
+    os.environ["HYRIVER_CACHE_EXPIRE"] = "0"
+
+    # Resolutions to try: requested first, then coarser fallbacks
+    _fallback_resolutions = sorted(
+        [r for r in SUPPORTED_3DEP_RESOLUTIONS if r >= resolution]
+    )
+    if not _fallback_resolutions:
+        _fallback_resolutions = [resolution]
 
     last_error: Optional[Exception] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(
-                "3DEP download attempt %d/%d (timeout=%ds) ...",
-                attempt, max_retries, timeout,
-            )
-            dem = py3dep.get_dem(bbox, resolution=resolution, crs="EPSG:4326")
-            break
-        except (TimeoutError, OSError, ConnectionError) as exc:
-            last_error = exc
+    for res in _fallback_resolutions:
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "3DEP download attempt %d/%d (res=%dm, timeout=%ds) ...",
+                    attempt, max_retries, res, timeout,
+                )
+                dem = py3dep.get_dem(bbox, resolution=res, crs="EPSG:4326")
+                if res != resolution:
+                    logger.warning(
+                        "Used fallback resolution %dm instead of %dm",
+                        res, resolution,
+                    )
+                break
+            except (TimeoutError, OSError, ConnectionError) as exc:
+                last_error = exc
+                logger.warning(
+                    "3DEP download attempt %d/%d (res=%dm) failed: %s",
+                    attempt, max_retries, res, exc,
+                )
+                if attempt < max_retries:
+                    import time
+                    wait = min(60, 10 * attempt)
+                    logger.info("Retrying in %ds ...", wait)
+                    time.sleep(wait)
+        else:
+            # All retries exhausted for this resolution, try next
             logger.warning(
-                "3DEP download attempt %d/%d failed: %s",
-                attempt, max_retries, exc,
+                "All %d attempts failed at %dm resolution, "
+                "trying coarser resolution ...",
+                max_retries, res,
             )
-            if attempt < max_retries:
-                import time
-                wait = min(30, 5 * attempt)
-                logger.info("Retrying in %ds ...", wait)
-                time.sleep(wait)
+            continue
+        break  # Success — exit the resolution loop
     else:
         raise TimeoutError(
-            f"3DEP DEM download failed after {max_retries} attempts"
+            f"3DEP DEM download failed after {max_retries} attempts "
+            f"across resolutions {_fallback_resolutions}. "
+            f"The 3DEP service may be down — try again later or increase "
+            f"max_retries via overrides: "
+            f"{{'dem_max_retries': 10, 'dem_timeout': 600}}"
         ) from last_error
 
     dem.rio.to_raster(str(output_path))
