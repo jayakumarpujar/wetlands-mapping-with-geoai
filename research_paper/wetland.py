@@ -2043,7 +2043,10 @@ def build_experiment_config(
         if k != "architectures"
     }
     if overrides:
-        valid_keys = set(training.keys())
+        valid_keys = set(training.keys()) | {
+            "download_max_retries", "download_timeout",
+            "pre_downloaded_dem", "pre_downloaded_dem_tiles",
+        }
         unknown = set(overrides) - valid_keys
         if unknown:
             raise ValueError(
