@@ -333,6 +333,95 @@ def _fill_depressions(
 # ---------------------------------------------------------------------------
 
 
+def merge_dem_tiles(
+    tile_paths: List[Union[str, Path]],
+    output_path: Union[str, Path],
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+    overwrite: bool = False,
+) -> str:
+    """Merge multiple DEM GeoTIFF tiles into a single file.
+
+    Useful when DEM tiles are manually downloaded from USGS 3DEP
+    (e.g. 1/3 arc-second NED tiles) and need to be combined before
+    use in the pipeline.
+
+    Args:
+        tile_paths: List of paths to DEM GeoTIFF tiles.
+        output_path: Path for the merged output GeoTIFF.
+        bbox: Optional (min_lon, min_lat, max_lon, max_lat) to clip
+              the merged result. If None, the full extent is kept.
+        overwrite: Re-create if output exists.
+
+    Returns:
+        Path to the merged DEM file.
+
+    Raises:
+        FileNotFoundError: If any tile path does not exist.
+        FileExistsError: If output exists and overwrite is False.
+    """
+    import rasterio
+    from rasterio.merge import merge
+
+    output_path = Path(output_path)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"Output file exists: {output_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Validate all tiles exist
+    for tp in tile_paths:
+        if not Path(tp).exists():
+            raise FileNotFoundError(f"DEM tile not found: {tp}")
+
+    logger.info("Merging %d DEM tiles ...", len(tile_paths))
+    datasets = [rasterio.open(str(tp)) for tp in tile_paths]
+    try:
+        mosaic, transform = merge(datasets)
+        profile = datasets[0].profile.copy()
+        profile.update(
+            driver="GTiff",
+            height=mosaic.shape[1],
+            width=mosaic.shape[2],
+            transform=transform,
+        )
+    finally:
+        for ds in datasets:
+            ds.close()
+
+    # Optionally clip to bbox
+    if bbox is not None:
+        _validate_bbox(bbox)
+        from rasterio.windows import from_bounds
+
+        min_lon, min_lat, max_lon, max_lat = bbox
+        window = from_bounds(min_lon, min_lat, max_lon, max_lat, transform)
+        row_off = max(0, int(window.row_off))
+        col_off = max(0, int(window.col_off))
+        height = min(int(window.height), mosaic.shape[1] - row_off)
+        width = min(int(window.width), mosaic.shape[2] - col_off)
+
+        mosaic = mosaic[:, row_off:row_off + height, col_off:col_off + width]
+
+        from rasterio.transform import Affine
+        new_transform = Affine(
+            transform.a, transform.b, transform.c + col_off * transform.a,
+            transform.d, transform.e, transform.f + row_off * transform.e,
+        )
+        profile.update(
+            height=height,
+            width=width,
+            transform=new_transform,
+        )
+
+    with rasterio.open(str(output_path), "w", **profile) as dst:
+        dst.write(mosaic)
+
+    logger.info(
+        "Merged DEM saved to %s (shape=%s)", output_path, mosaic.shape
+    )
+    return str(output_path)
+
+
 def download_naip_timeseries(
     bbox: Tuple[float, float, float, float],
     output_dir: Union[str, Path],

@@ -33,6 +33,7 @@ from research_paper.wetland import (
     download_3dep_dem,
     download_naip_timeseries,
     download_nwi,
+    merge_dem_tiles,
     export_training_tiles,
     extract_surface_depressions,
     format_results_table,
@@ -72,13 +73,28 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
         **retry_kwargs,
     )
 
-    logger.info("Downloading 3DEP DEM ...")
-    dem_path = download_3dep_dem(
-        bbox=bbox,
-        output_path=paths["dem_path"],
-        resolution=config["training"].get("dem_resolution", 1),
-        **retry_kwargs,
-    )
+    # Support pre-downloaded DEM tiles (skip 3DEP API)
+    pre_dem_tiles = config["training"].get("pre_downloaded_dem_tiles")
+    pre_dem_path = config["training"].get("pre_downloaded_dem")
+    if pre_dem_path:
+        logger.info("Using pre-downloaded DEM: %s", pre_dem_path)
+        dem_path = str(pre_dem_path)
+    elif pre_dem_tiles:
+        logger.info("Merging %d pre-downloaded DEM tiles ...", len(pre_dem_tiles))
+        dem_path = merge_dem_tiles(
+            tile_paths=pre_dem_tiles,
+            output_path=paths["dem_path"],
+            bbox=bbox,
+            overwrite=True,
+        )
+    else:
+        logger.info("Downloading 3DEP DEM ...")
+        dem_path = download_3dep_dem(
+            bbox=bbox,
+            output_path=paths["dem_path"],
+            resolution=config["training"].get("dem_resolution", 1),
+            **retry_kwargs,
+        )
 
     logger.info("Downloading NWI ...")
     nwi_path = download_nwi(
