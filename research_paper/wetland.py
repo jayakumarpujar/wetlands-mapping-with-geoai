@@ -645,31 +645,44 @@ def download_nwi(
 
     max_retries = kwargs.get("max_retries", 3)
     timeout = kwargs.get("timeout", 120)
-    page_size = 2000  # ArcGIS REST services often cap at 1000-2000
 
-    # Paginate through all results using resultOffset
+    # Split bbox into a grid of smaller tiles to avoid record-count limits.
+    # The NWI endpoint does not support resultOffset pagination, so we
+    # subdivide the study area spatially instead.
+    grid_n = 4  # 4x4 = 16 sub-tiles
+    lon_step = (max_lon - min_lon) / grid_n
+    lat_step = (max_lat - min_lat) / grid_n
+
+    sub_bboxes = []
+    for i in range(grid_n):
+        for j in range(grid_n):
+            sub_bboxes.append((
+                min_lon + i * lon_step,
+                min_lat + j * lat_step,
+                min_lon + (i + 1) * lon_step,
+                min_lat + (j + 1) * lat_step,
+            ))
+
     all_features: list = []
-    result_offset = 0
 
-    while True:
+    for tile_idx, sub_bbox in enumerate(sub_bboxes):
+        slon0, slat0, slon1, slat1 = sub_bbox
         params = {
-            "geometry": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+            "geometry": f"{slon0},{slat0},{slon1},{slat1}",
             "geometryType": "esriGeometryEnvelope",
             "inSR": "4326",
             "outSR": "4326",
             "spatialRel": "esriSpatialRelIntersects",
             "outFields": "*",
             "f": "geojson",
-            "resultRecordCount": page_size,
-            "resultOffset": result_offset,
         }
 
         last_error: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(
-                    "Querying NWI for bbox %s (offset=%d, attempt %d/%d) ...",
-                    bbox, result_offset, attempt, max_retries,
+                    "Querying NWI tile %d/%d (attempt %d/%d) ...",
+                    tile_idx + 1, len(sub_bboxes), attempt, max_retries,
                 )
                 resp = requests.get(url, params=params, timeout=timeout)
                 resp.raise_for_status()
@@ -701,20 +714,13 @@ def download_nwi(
             )
 
         features = data.get("features", [])
-        if not features:
-            break
-
-        all_features.extend(features)
-        logger.info(
-            "Fetched %d NWI features (total so far: %d)",
-            len(features), len(all_features),
-        )
-
-        # If we got fewer than page_size, we've reached the end
-        if len(features) < page_size:
-            break
-
-        result_offset += len(features)
+        if features:
+            all_features.extend(features)
+            logger.info(
+                "Fetched %d NWI features from tile %d/%d (total: %d)",
+                len(features), tile_idx + 1, len(sub_bboxes),
+                len(all_features),
+            )
 
     if not all_features:
         raise RuntimeError(
@@ -723,6 +729,13 @@ def download_nwi(
         )
 
     gdf = gpd.GeoDataFrame.from_features(all_features, crs="EPSG:4326")
+
+    # Deduplicate features that appear in overlapping sub-tiles
+    before = len(gdf)
+    gdf = gdf.drop_duplicates(subset=["geometry"])
+    if len(gdf) < before:
+        logger.info("Removed %d duplicate NWI polygons", before - len(gdf))
+
     gdf.to_file(str(output_path), driver="GPKG")
     logger.info("Saved %d NWI polygons to %s", len(gdf), output_path)
 
