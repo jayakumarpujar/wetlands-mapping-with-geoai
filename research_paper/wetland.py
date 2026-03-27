@@ -458,6 +458,7 @@ def download_naip_timeseries(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     max_retries = kwargs.pop("max_retries", 3)
+    kwargs.pop("timeout", None)
 
     results: Dict[int, List[str]] = {}
     for year in years:
