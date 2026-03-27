@@ -103,12 +103,18 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
             **retry_kwargs,
         )
 
-    logger.info("Downloading NWI ...")
-    nwi_path = download_nwi(
-        bbox=bbox,
-        output_path=paths["nwi_path"],
-        **retry_kwargs,
-    )
+    # Support pre-downloaded NWI file (skip USFWS API)
+    pre_nwi = config["training"].get("pre_downloaded_nwi")
+    if pre_nwi:
+        logger.info("Using pre-downloaded NWI: %s", pre_nwi)
+        nwi_path = str(pre_nwi)
+    else:
+        logger.info("Downloading NWI ...")
+        nwi_path = download_nwi(
+            bbox=bbox,
+            output_path=paths["nwi_path"],
+            **retry_kwargs,
+        )
 
     return {
         "naip_files": naip_files,

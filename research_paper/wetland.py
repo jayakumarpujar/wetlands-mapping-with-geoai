@@ -695,9 +695,16 @@ def download_nwi(
                     ValueError,
                     requests.exceptions.JSONDecodeError) as exc:
                 last_error = exc
+                # Log response text to help debug non-JSON responses
+                resp_preview = ""
+                try:
+                    resp_preview = f" | Response: {resp.text[:300]}"
+                except Exception:
+                    pass
                 logger.warning(
-                    "NWI tile %d/%d attempt %d/%d failed: %s",
-                    tile_idx + 1, len(sub_bboxes), attempt, max_retries, exc,
+                    "NWI tile %d/%d attempt %d/%d failed: %s%s",
+                    tile_idx + 1, len(sub_bboxes), attempt, max_retries,
+                    exc, resp_preview,
                 )
                 if attempt < max_retries:
                     import time
@@ -2100,7 +2107,7 @@ def build_experiment_config(
         valid_keys = set(training.keys()) | {
             "download_max_retries", "download_timeout",
             "pre_downloaded_dem", "pre_downloaded_dem_tiles",
-            "pre_downloaded_naip",
+            "pre_downloaded_naip", "pre_downloaded_nwi",
         }
         unknown = set(overrides) - valid_keys
         if unknown:
