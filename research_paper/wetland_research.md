@@ -289,7 +289,7 @@ Functions implemented in `research_paper/wetland.py`:
 **Constants:** `PPR_STUDY_AREA` (bbox, naip_years, huc8_codes for Wu 2019 study area), `EXPERIMENT_DEFAULTS` (training hyperparameters: tile_size=256, num_epochs=50, batch_size=8, lr=1e-3, 6 classes, 10 input channels, focal loss, U-Net++ and DeepLabV3+ architectures)
 
 **Experiment script** (`research_paper/run_experiment.py`):
-- [x] `run_ppr_experiment(output_root, overrides)` — end-to-end pipeline orchestration
+- [x] `run_ppr_experiment(output_root, overrides)` — end-to-end pipeline orchestration with real-time `print(..., flush=True)` progress for each phase (Colab buffers `logging` output, so explicit flush is required for visibility)
 - [x] `run_data_download(config)` — Phase 1a: NAIP + DEM + NWI download
 - [x] `run_composites(config, download_result)` — Phase 1b: indices, depressions, composites with separate NDVI/NDWI extraction
 - [x] `run_weak_labels(config, download_result, composite_result)` — Phase 2: NWI reclassification + temporal filtering + tiles
@@ -330,6 +330,7 @@ Remaining paper tasks (manual execution):
 | 2026-03-26 | Override key validation in experiment config | build_experiment_config rejects unknown override keys to prevent silent typo bugs (e.g. "num_epoch" vs "num_epochs") that would silently drop intended overrides |
 | 2026-03-26 | Separate NDVI/NDWI extraction for temporal filtering | run_composites writes single-band NDVI and NDWI files from multi-band indices raster; prevents generate_weak_labels from reading NDVI band as NDWI |
 | 2026-03-26 | 10 input channels for experiment | 4 NAIP bands + NDVI + NDWI (2015) + NDVI + NDWI (2017) + elevation + depression depth = 10 channels; matches study-area-specific multi-temporal stack |
+| 2026-03-27 | Flushed print progress in run_experiment | Colab buffers `logging` output for long-running cells; replaced `logger.info` with `print(..., flush=True)` in `run_ppr_experiment` so users see phase timing (e.g. `[120s] Phase 3: Training models ...`) in real-time |
 
 ---
 
