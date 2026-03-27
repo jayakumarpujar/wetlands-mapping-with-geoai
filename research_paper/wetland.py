@@ -646,6 +646,17 @@ def download_nwi(
     max_retries = kwargs.get("max_retries", 3)
     timeout = kwargs.get("timeout", 120)
 
+    # Use browser-like headers — the NWI server returns HTML block pages
+    # for requests with the default python-requests User-Agent.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    }
+
     # Split bbox into a grid of smaller tiles to avoid record-count limits.
     # The NWI endpoint does not support resultOffset pagination, so we
     # subdivide the study area spatially instead.
@@ -685,7 +696,7 @@ def download_nwi(
                     "Querying NWI tile %d/%d (attempt %d/%d) ...",
                     tile_idx + 1, len(sub_bboxes), attempt, max_retries,
                 )
-                resp = requests.get(url, params=params, timeout=timeout)
+                resp = requests.get(url, params=params, headers=headers, timeout=timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 break
