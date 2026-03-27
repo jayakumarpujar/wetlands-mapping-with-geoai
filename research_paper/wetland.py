@@ -642,49 +642,87 @@ def download_nwi(
         "https://fwsprimary.wim.usgs.gov/server/rest/services/"
         "Wetlands/MapServer/0/query"
     )
-    params = {
-        "geometry": f"{min_lon},{min_lat},{max_lon},{max_lat}",
-        "geometryType": "esriGeometryEnvelope",
-        "inSR": "4326",
-        "outSR": "4326",
-        "spatialRel": "esriSpatialRelIntersects",
-        "outFields": "*",
-        "f": "geojson",
-        "resultRecordCount": 10000,
-    }
 
     max_retries = kwargs.get("max_retries", 3)
     timeout = kwargs.get("timeout", 120)
+    page_size = 2000  # ArcGIS REST services often cap at 1000-2000
 
-    last_error: Optional[Exception] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(
-                "Querying NWI for bbox %s (attempt %d/%d) ...",
-                bbox, attempt, max_retries,
+    # Paginate through all results using resultOffset
+    all_features: list = []
+    result_offset = 0
+
+    while True:
+        params = {
+            "geometry": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "outSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "*",
+            "f": "geojson",
+            "resultRecordCount": page_size,
+            "resultOffset": result_offset,
+        }
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Querying NWI for bbox %s (offset=%d, attempt %d/%d) ...",
+                    bbox, result_offset, attempt, max_retries,
+                )
+                resp = requests.get(url, params=params, timeout=timeout)
+                resp.raise_for_status()
+                break
+            except (TimeoutError, OSError, ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError) as exc:
+                last_error = exc
+                logger.warning(
+                    "NWI download attempt %d/%d failed: %s",
+                    attempt, max_retries, exc,
+                )
+                if attempt < max_retries:
+                    import time
+                    wait = min(30, 5 * attempt)
+                    logger.info("Retrying in %ds ...", wait)
+                    time.sleep(wait)
+        else:
+            raise TimeoutError(
+                f"NWI download failed after {max_retries} attempts"
+            ) from last_error
+
+        data = resp.json()
+
+        # Handle API error responses
+        if "error" in data:
+            raise RuntimeError(
+                f"NWI API error: {data['error'].get('message', data['error'])}"
             )
-            resp = requests.get(url, params=params, timeout=timeout)
-            resp.raise_for_status()
+
+        features = data.get("features", [])
+        if not features:
             break
-        except (TimeoutError, OSError, ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError) as exc:
-            last_error = exc
-            logger.warning(
-                "NWI download attempt %d/%d failed: %s",
-                attempt, max_retries, exc,
-            )
-            if attempt < max_retries:
-                import time
-                wait = min(30, 5 * attempt)
-                logger.info("Retrying in %ds ...", wait)
-                time.sleep(wait)
-    else:
-        raise TimeoutError(
-            f"NWI download failed after {max_retries} attempts"
-        ) from last_error
 
-    gdf = gpd.GeoDataFrame.from_features(resp.json()["features"], crs="EPSG:4326")
+        all_features.extend(features)
+        logger.info(
+            "Fetched %d NWI features (total so far: %d)",
+            len(features), len(all_features),
+        )
+
+        # If we got fewer than page_size, we've reached the end
+        if len(features) < page_size:
+            break
+
+        result_offset += len(features)
+
+    if not all_features:
+        raise RuntimeError(
+            f"NWI query returned no features for bbox {bbox}. "
+            "The area may be too large or the service may be down."
+        )
+
+    gdf = gpd.GeoDataFrame.from_features(all_features, crs="EPSG:4326")
     gdf.to_file(str(output_path), driver="GPKG")
     logger.info("Saved %d NWI polygons to %s", len(gdf), output_path)
 
