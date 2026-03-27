@@ -2047,6 +2047,7 @@ def build_experiment_config(
         valid_keys = set(training.keys()) | {
             "download_max_retries", "download_timeout",
             "pre_downloaded_dem", "pre_downloaded_dem_tiles",
+            "pre_downloaded_naip",
         }
         unknown = set(overrides) - valid_keys
         if unknown:

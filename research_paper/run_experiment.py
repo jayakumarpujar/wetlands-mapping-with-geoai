@@ -65,13 +65,20 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
         "timeout": config["training"].get("download_timeout", 300),
     }
 
-    logger.info("Downloading NAIP timeseries for years %s ...", years)
-    naip_files = download_naip_timeseries(
-        bbox=bbox,
-        output_dir=paths["naip_dir"],
-        years=years,
-        **retry_kwargs,
-    )
+    # Support pre-downloaded NAIP files (skip STAC API)
+    pre_naip = config["training"].get("pre_downloaded_naip")
+    if pre_naip:
+        logger.info("Using %d pre-downloaded NAIP year(s)", len(pre_naip))
+        naip_files = {int(yr): [str(p) for p in paths_list]
+                      for yr, paths_list in pre_naip.items()}
+    else:
+        logger.info("Downloading NAIP timeseries for years %s ...", years)
+        naip_files = download_naip_timeseries(
+            bbox=bbox,
+            output_dir=paths["naip_dir"],
+            years=years,
+            **retry_kwargs,
+        )
 
     # Support pre-downloaded DEM tiles (skip 3DEP API)
     pre_dem_tiles = config["training"].get("pre_downloaded_dem_tiles")
