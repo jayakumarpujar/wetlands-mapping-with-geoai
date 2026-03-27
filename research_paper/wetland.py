@@ -639,8 +639,8 @@ def download_nwi(
 
     min_lon, min_lat, max_lon, max_lat = bbox
     url = (
-        "https://fwsprimary.wim.usgs.gov/server/rest/services/"
-        "Wetlands/MapServer/0/query"
+        "https://fwspublicservices.wim.usgs.gov/wetlandsmapservice/"
+        "rest/services/Wetlands/MapServer/0/query"
     )
 
     max_retries = kwargs.get("max_retries", 3)
