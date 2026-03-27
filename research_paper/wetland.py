@@ -678,6 +678,7 @@ def download_nwi(
         }
 
         last_error: Optional[Exception] = None
+        data = None
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(
@@ -686,14 +687,17 @@ def download_nwi(
                 )
                 resp = requests.get(url, params=params, timeout=timeout)
                 resp.raise_for_status()
+                data = resp.json()
                 break
             except (TimeoutError, OSError, ConnectionError,
                     requests.exceptions.Timeout,
-                    requests.exceptions.ConnectionError) as exc:
+                    requests.exceptions.ConnectionError,
+                    ValueError,
+                    requests.exceptions.JSONDecodeError) as exc:
                 last_error = exc
                 logger.warning(
-                    "NWI download attempt %d/%d failed: %s",
-                    attempt, max_retries, exc,
+                    "NWI tile %d/%d attempt %d/%d failed: %s",
+                    tile_idx + 1, len(sub_bboxes), attempt, max_retries, exc,
                 )
                 if attempt < max_retries:
                     import time
@@ -704,8 +708,6 @@ def download_nwi(
             raise TimeoutError(
                 f"NWI download failed after {max_retries} attempts"
             ) from last_error
-
-        data = resp.json()
 
         # Handle API error responses
         if "error" in data:
