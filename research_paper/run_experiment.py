@@ -265,7 +265,10 @@ def run_training(
         encoder = arch_cfg.get("encoder_name", "resnet50")
         model_dir = str(models_dir / f"{arch_name}_{encoder}")
 
-        logger.info("Training %s with %s encoder ...", arch_name, encoder)
+        print(
+            f"  Training {arch_name} ({encoder}) ...",
+            flush=True,
+        )
 
         result = train_wetland_model(
             tiles_dir=label_result["tiles_dir"],
@@ -316,7 +319,7 @@ def run_inference(
                 predictions_dir / f"pred_{arch}_{encoder}_{epoch_name}.tif"
             )
 
-            logger.info("Predicting %s with %s ...", epoch_name, arch)
+            print(f"  Predicting {epoch_name} with {arch} ...", flush=True)
             predict_wetlands(
                 model_path=model_info["model_path"],
                 composite_path=composite_path,
@@ -410,31 +413,51 @@ def run_ppr_experiment(
     """
     t0 = time.time()
 
+    def _elapsed() -> str:
+        return f"[{time.time() - t0:.0f}s]"
+
     # Build configuration
     config = build_experiment_config(
         study_area=PPR_STUDY_AREA,
         output_root=output_root,
         overrides=overrides,
     )
-    logger.info(
-        "Experiment config: %d architectures, %d epochs",
-        len(config["architectures"]),
-        config["training"]["num_epochs"],
+    print(
+        f"{_elapsed()} Experiment: {len(config['architectures'])} architectures, "
+        f"{config['training']['num_epochs']} epochs, output={output_root}",
+        flush=True,
     )
 
     # Phase 1: Data download and composites
+    print(f"{_elapsed()} Phase 1a: Downloading / loading data ...", flush=True)
     download_result = run_data_download(config)
+    print(f"{_elapsed()} Phase 1a complete.", flush=True)
+
+    print(f"{_elapsed()} Phase 1b: Computing composites & indices ...", flush=True)
     composite_result = run_composites(config, download_result)
+    print(
+        f"{_elapsed()} Phase 1b complete: {len(composite_result['composite_paths'])} composites.",
+        flush=True,
+    )
 
     # Phase 2: Weak labels and tiles
+    print(f"{_elapsed()} Phase 2: Generating weak labels & tiles ...", flush=True)
     label_result = run_weak_labels(config, download_result, composite_result)
+    print(f"{_elapsed()} Phase 2 complete.", flush=True)
 
     # Phase 3: Training
+    print(f"{_elapsed()} Phase 3: Training models ...", flush=True)
     trained_models = run_training(config, label_result)
+    print(
+        f"{_elapsed()} Phase 3 complete: trained {len(trained_models)} model(s).",
+        flush=True,
+    )
 
     # Phase 4: Inference and evaluation
+    print(f"{_elapsed()} Phase 4: Inference & evaluation ...", flush=True)
     all_predictions = run_inference(config, trained_models, composite_result)
     all_results = run_evaluation(config, all_predictions, label_result)
+    print(f"{_elapsed()} Phase 4 complete.", flush=True)
 
     # Save results
     results_path = str(Path(config["paths"]["results_dir"]) / "experiment_results.json")
@@ -447,8 +470,8 @@ def run_ppr_experiment(
     # Print summary
     table = format_results_table(all_results)
     elapsed = time.time() - t0
-    logger.info("Experiment completed in %.1f seconds.", elapsed)
-    print("\n" + table + "\n")
+    print(f"\nExperiment completed in {elapsed:.1f} seconds.\n", flush=True)
+    print(table + "\n", flush=True)
 
     return {
         "config": config,
