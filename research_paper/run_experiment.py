@@ -353,32 +353,26 @@ def run_weak_labels(
         print("  NWI raster already exists, reusing.", flush=True)
 
     # Generate weak labels with depression + temporal filtering
+    # Always regenerate — thresholds may have changed between runs
     weak_label_path = str(composites_dir / "weak_labels.tif")
-    if not Path(weak_label_path).exists():
-        generate_weak_labels(
-            nwi_raster_path=nwi_raster_path,
-            depression_path=composite_result["depression_path"],
-            ndvi_paths=composite_result["ndvi_paths"],
-            ndwi_paths=composite_result["ndwi_paths"],
-            output_path=weak_label_path,
-        )
-    else:
-        print("  Weak labels already exist, reusing.", flush=True)
+    generate_weak_labels(
+        nwi_raster_path=nwi_raster_path,
+        depression_path=composite_result["depression_path"],
+        ndvi_paths=composite_result["ndvi_paths"],
+        ndwi_paths=composite_result["ndwi_paths"],
+        output_path=weak_label_path,
+        overwrite=True,
+    )
 
     # Export training tiles from the training composite
-    tiles_path = Path(tiles_dir)
-    existing_tiles = list(tiles_path.glob("tile_*_image.tif")) if tiles_path.exists() else []
-    if existing_tiles:
-        num_tiles = len(existing_tiles)
-        print(f"  {num_tiles} training tiles already exist, reusing.", flush=True)
-    else:
-        tile_result = export_training_tiles(
-            composite_path=composite_for_tiles,
-            label_path=weak_label_path,
-            output_dir=tiles_dir,
-            tile_size=config["training"]["tile_size"],
-        )
-        num_tiles = tile_result["num_tiles"]
+    tile_result = export_training_tiles(
+        composite_path=composite_for_tiles,
+        label_path=weak_label_path,
+        output_dir=tiles_dir,
+        tile_size=config["training"]["tile_size"],
+        overwrite=True,
+    )
+    num_tiles = tile_result["num_tiles"]
 
     if num_tiles == 0:
         raise RuntimeError(

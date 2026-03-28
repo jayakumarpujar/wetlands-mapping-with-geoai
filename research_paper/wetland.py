@@ -1169,8 +1169,8 @@ def generate_weak_labels(
     ndwi_paths: List[Union[str, Path]],
     output_path: Union[str, Path],
     depression_threshold: float = 0.0,
-    stability_threshold: float = 0.05,
-    min_component_fraction: float = 0.5,
+    stability_threshold: float = 0.3,
+    min_component_fraction: float = 0.25,
     overwrite: bool = False,
     **kwargs: Any,
 ) -> str:
@@ -1275,12 +1275,25 @@ def generate_weak_labels(
 
     # Step 1: Start with NWI labels
     reliable = labels > 0  # mask of pixels with any label
+    n_nwi = int(np.sum(reliable))
+    print(f"  Weak labels step 1 (NWI): {n_nwi} labeled pixels", flush=True)
+
+    if n_nwi == 0:
+        # No NWI labels in the study area — write empty and return early
+        profile.update(dtype="uint8", count=1, nodata=0)
+        with rasterio.open(output_path, "w", **profile) as dst:
+            dst.write(labels, 1)
+        logger.warning("No NWI wetland labels found in study area.")
+        return str(output_path)
 
     # Step 2: Depression filter — keep only wetland pixels in depressions
     dep_valid = dep_data > depression_threshold
     if dep_nodata is not None:
         dep_valid &= dep_data != dep_nodata
     reliable &= dep_valid
+    n_dep = int(np.sum(reliable))
+    print(f"  Weak labels step 2 (depression filter): {n_dep} pixels remain "
+          f"({100*n_dep/max(n_nwi,1):.1f}%)", flush=True)
 
     # Helper: read a single-band raster, reprojecting to ref grid if needed
     def _read_aligned(path: str) -> np.ndarray:
@@ -1311,6 +1324,10 @@ def generate_weak_labels(
             ndwi_change = np.abs(ndwi2 - ndwi1)
             reliable &= ndwi_change <= stability_threshold
 
+    n_stable = int(np.sum(reliable))
+    print(f"  Weak labels step 3 (stability filter, thresh={stability_threshold}): "
+          f"{n_stable} pixels remain ({100*n_stable/max(n_nwi,1):.1f}%)", flush=True)
+
     # Step 4: Object-level confidence filtering
     # Label connected components per class
     output_labels = np.zeros_like(labels)
@@ -1330,13 +1347,20 @@ def generate_weak_labels(
             if total_pixels > 0 and (reliable_pixels / total_pixels) >= min_component_fraction:
                 output_labels[comp_mask] = cls
 
-    # Write output
-    profile.update(dtype="uint8", count=1, nodata=0)
+    # Write output — strip tiling params to avoid BLOCKXSIZE warning
+    profile.update(dtype="uint8", count=1, nodata=0, tiled=False)
+    profile.pop("blockxsize", None)
+    profile.pop("blockysize", None)
     with rasterio.open(output_path, "w", **profile) as dst:
         dst.write(output_labels.astype(np.uint8), 1)
 
-    retained = np.sum(output_labels > 0)
-    original = np.sum(labels > 0)
+    retained = int(np.sum(output_labels > 0))
+    original = int(np.sum(labels > 0))
+    print(
+        f"  Weak labels step 4 (component filter): {retained}/{original} pixels "
+        f"retained ({100*retained/max(original,1):.1f}%)",
+        flush=True,
+    )
     logger.info(
         "Generated weak labels: %d/%d pixels retained (%.1f%%) -> %s",
         retained,
@@ -1353,7 +1377,7 @@ def export_training_tiles(
     output_dir: Union[str, Path],
     tile_size: int = 256,
     stride: Optional[int] = None,
-    min_valid_fraction: float = 0.5,
+    min_valid_fraction: float = 0.01,
     overwrite: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -1402,9 +1426,6 @@ def export_training_tiles(
 
     if stride is None:
         stride = tile_size
-
-    if output_dir.exists() and not overwrite:
-        raise FileExistsError(f"Output directory exists: {output_dir}")
 
     img_dir = output_dir / "images"
     lbl_dir = output_dir / "labels"
