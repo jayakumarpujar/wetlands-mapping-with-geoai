@@ -1232,13 +1232,31 @@ def generate_weak_labels(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Read inputs
+    import rasterio
+    from rasterio.warp import Resampling, reproject
+
     with rasterio.open(nwi_raster_path) as src:
         labels = src.read(1).astype(np.uint8)
         profile = src.profile.copy()
+        ref_shape = labels.shape
+        ref_transform = src.transform
+        ref_crs = src.crs
 
     with rasterio.open(depression_path) as src:
-        dep_data = src.read(1).astype(np.float64)
         dep_nodata = src.nodata
+        # Reproject/resample depression to match NWI raster grid if shapes differ
+        if (src.height, src.width) != ref_shape:
+            dep_data = np.empty(ref_shape, dtype=np.float64)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=dep_data,
+                dst_transform=ref_transform,
+                dst_crs=ref_crs,
+                dst_nodata=dep_nodata,
+                resampling=Resampling.bilinear,
+            )
+        else:
+            dep_data = src.read(1).astype(np.float64)
 
     # Step 1: Start with NWI labels
     reliable = labels > 0  # mask of pixels with any label
@@ -1249,19 +1267,32 @@ def generate_weak_labels(
         dep_valid &= dep_data != dep_nodata
     reliable &= dep_valid
 
+    # Helper: read a single-band raster, reprojecting to ref grid if needed
+    def _read_aligned(path: str) -> np.ndarray:
+        with rasterio.open(path) as src:
+            if (src.height, src.width) != ref_shape:
+                arr = np.empty(ref_shape, dtype=np.float64)
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=arr,
+                    dst_transform=ref_transform,
+                    dst_crs=ref_crs,
+                    resampling=Resampling.bilinear,
+                )
+                return arr
+            return src.read(1).astype(np.float64)
+
     # Step 3: Temporal stability filter
     if len(ndvi_paths) >= 2:
         for i in range(len(ndvi_paths) - 1):
-            with rasterio.open(ndvi_paths[i]) as s1, rasterio.open(ndvi_paths[i + 1]) as s2:
-                ndvi1 = s1.read(1).astype(np.float64)
-                ndvi2 = s2.read(1).astype(np.float64)
+            ndvi1 = _read_aligned(ndvi_paths[i])
+            ndvi2 = _read_aligned(ndvi_paths[i + 1])
             ndvi_change = np.abs(ndvi2 - ndvi1)
             reliable &= ndvi_change <= stability_threshold
 
         for i in range(len(ndwi_paths) - 1):
-            with rasterio.open(ndwi_paths[i]) as s1, rasterio.open(ndwi_paths[i + 1]) as s2:
-                ndwi1 = s1.read(1).astype(np.float64)
-                ndwi2 = s2.read(1).astype(np.float64)
+            ndwi1 = _read_aligned(ndwi_paths[i])
+            ndwi2 = _read_aligned(ndwi_paths[i + 1])
             ndwi_change = np.abs(ndwi2 - ndwi1)
             reliable &= ndwi_change <= stability_threshold
 
