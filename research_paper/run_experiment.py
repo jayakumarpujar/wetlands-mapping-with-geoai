@@ -74,13 +74,27 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
         naip_files = {int(yr): [str(p) for p in paths_list]
                       for yr, paths_list in pre_naip.items()}
     else:
-        logger.info("Downloading NAIP timeseries for years %s ...", years)
-        naip_files = download_naip_timeseries(
-            bbox=bbox,
-            output_dir=paths["naip_dir"],
-            years=years,
-            **retry_kwargs,
-        )
+        # Check if NAIP files already exist on disk (resume after crash)
+        naip_dir = Path(paths["naip_dir"])
+        existing_naip: Dict[int, list] = {}
+        for year in years:
+            year_dir = naip_dir / str(year)
+            if year_dir.exists():
+                tifs = sorted(str(f) for f in year_dir.glob("*.tif"))
+                if tifs:
+                    existing_naip[year] = tifs
+        if existing_naip and len(existing_naip) == len(years):
+            logger.info("NAIP already exists for all years, reusing %s",
+                        {y: len(f) for y, f in existing_naip.items()})
+            naip_files = existing_naip
+        else:
+            logger.info("Downloading NAIP timeseries for years %s ...", years)
+            naip_files = download_naip_timeseries(
+                bbox=bbox,
+                output_dir=paths["naip_dir"],
+                years=years,
+                **retry_kwargs,
+            )
 
     # Support pre-downloaded DEM tiles (skip 3DEP API)
     pre_dem_tiles = config["training"].get("pre_downloaded_dem_tiles")
@@ -96,6 +110,9 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
             bbox=bbox,
             overwrite=True,
         )
+    elif Path(paths["dem_path"]).exists():
+        logger.info("DEM already exists, reusing: %s", paths["dem_path"])
+        dem_path = str(paths["dem_path"])
     else:
         logger.info("Downloading 3DEP DEM ...")
         dem_path = download_3dep_dem(
@@ -110,6 +127,9 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
     if pre_nwi:
         logger.info("Using pre-downloaded NWI: %s", pre_nwi)
         nwi_path = str(pre_nwi)
+    elif Path(paths["nwi_path"]).exists():
+        logger.info("NWI already exists, reusing: %s", paths["nwi_path"])
+        nwi_path = str(paths["nwi_path"])
     else:
         logger.info("Downloading NWI ...")
         nwi_path = download_nwi(
@@ -135,6 +155,26 @@ def run_composites(
 
     dem_path = download_result["dem_path"]
     naip_files = download_result["naip_files"]
+    years = sorted(naip_files.keys())
+
+    # --- Resume check: if training composite already exists, skip recompute ---
+    training_composite_path = str(composites_dir / "training_composite.tif")
+    depression_path = str(composites_dir / "depression_depth.tif")
+    if Path(training_composite_path).exists():
+        print("  Training composite already exists, skipping recompute.", flush=True)
+        # Reconstruct result dict from existing files
+        composite_paths = [str(p) for p in sorted(composites_dir.glob("composite_*.tif"))]
+        ndvi_paths = [str(p) for p in sorted(composites_dir.glob("ndvi_*.tif"))]
+        ndwi_paths = [str(p) for p in sorted(composites_dir.glob("ndwi_*.tif"))]
+        if not Path(depression_path).exists():
+            depression_path = None
+        return {
+            "composite_paths": composite_paths,
+            "training_composite_path": training_composite_path,
+            "ndvi_paths": ndvi_paths,
+            "ndwi_paths": ndwi_paths,
+            "depression_path": depression_path,
+        }
 
     # Extract surface depressions from DEM
     logger.info("Extracting surface depressions ...")
@@ -292,32 +332,43 @@ def run_weak_labels(
 
     # Reclassify NWI to Cowardin classes (use same grid as training composite)
     nwi_raster_path = str(composites_dir / "nwi_raster.tif")
-    reclassify_nwi(
-        nwi_path=download_result["nwi_path"],
-        raster_template=composite_for_tiles,
-        output_path=nwi_raster_path,
-    )
+    if not Path(nwi_raster_path).exists():
+        reclassify_nwi(
+            nwi_path=download_result["nwi_path"],
+            raster_template=composite_for_tiles,
+            output_path=nwi_raster_path,
+        )
+    else:
+        print("  NWI raster already exists, reusing.", flush=True)
 
     # Generate weak labels with depression + temporal filtering
     weak_label_path = str(composites_dir / "weak_labels.tif")
-
-    generate_weak_labels(
-        nwi_raster_path=nwi_raster_path,
-        depression_path=composite_result["depression_path"],
-        ndvi_paths=composite_result["ndvi_paths"],
-        ndwi_paths=composite_result["ndwi_paths"],
-        output_path=weak_label_path,
-    )
+    if not Path(weak_label_path).exists():
+        generate_weak_labels(
+            nwi_raster_path=nwi_raster_path,
+            depression_path=composite_result["depression_path"],
+            ndvi_paths=composite_result["ndvi_paths"],
+            ndwi_paths=composite_result["ndwi_paths"],
+            output_path=weak_label_path,
+        )
+    else:
+        print("  Weak labels already exist, reusing.", flush=True)
 
     # Export training tiles from the training composite
-    tile_result = export_training_tiles(
-        composite_path=composite_for_tiles,
-        label_path=weak_label_path,
-        output_dir=tiles_dir,
-        tile_size=config["training"]["tile_size"],
-    )
+    tiles_path = Path(tiles_dir)
+    existing_tiles = list(tiles_path.glob("tile_*_image.tif")) if tiles_path.exists() else []
+    if existing_tiles:
+        num_tiles = len(existing_tiles)
+        print(f"  {num_tiles} training tiles already exist, reusing.", flush=True)
+    else:
+        tile_result = export_training_tiles(
+            composite_path=composite_for_tiles,
+            label_path=weak_label_path,
+            output_dir=tiles_dir,
+            tile_size=config["training"]["tile_size"],
+        )
+        num_tiles = tile_result["num_tiles"]
 
-    num_tiles = tile_result["num_tiles"]
     if num_tiles == 0:
         raise RuntimeError(
             "No training tiles were generated. Check that NWI covers the study area "
