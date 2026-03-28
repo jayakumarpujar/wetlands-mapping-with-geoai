@@ -1109,21 +1109,52 @@ def reclassify_nwi(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     gdf = gpd.read_file(str(nwi_path))
+    print(f"  NWI: loaded {len(gdf)} polygons, columns: {list(gdf.columns)}", flush=True)
 
     with rasterio.open(raster_template) as tmpl:
         tmpl_crs = tmpl.crs
         tmpl_transform = tmpl.transform
         tmpl_height = tmpl.height
         tmpl_width = tmpl.width
+        tmpl_bounds = tmpl.bounds
+    print(f"  Template grid: {tmpl_width}x{tmpl_height}, CRS={tmpl_crs}, "
+          f"bounds={tmpl_bounds}", flush=True)
 
     # Reproject NWI to template CRS if needed
     if gdf.crs and not gdf.crs.equals(tmpl_crs):
         gdf = gdf.to_crs(tmpl_crs)
 
+    # Clip to template bounds to avoid rasterizing polygons outside the grid
+    from shapely.geometry import box as shapely_box
+    clip_geom = shapely_box(tmpl_bounds.left, tmpl_bounds.bottom,
+                            tmpl_bounds.right, tmpl_bounds.top)
+    gdf = gdf[gdf.geometry.intersects(clip_geom)]
+    print(f"  NWI: {len(gdf)} polygons intersect the template extent", flush=True)
+
+    # Try common NWI attribute field names
+    attr_candidates = [attribute_field, "ATTRIBUTE", "WETLAND_TYPE", "wetland_type"]
+    used_field = None
+    for candidate in attr_candidates:
+        if candidate in gdf.columns:
+            used_field = candidate
+            break
+    if used_field is None and len(gdf.columns) > 1:
+        # Show available columns so the user can identify the right one
+        print(f"  WARNING: '{attribute_field}' not found. "
+              f"Available columns: {list(gdf.columns)}", flush=True)
+        # Fallback: check for any column containing 'attr' or 'type'
+        for col in gdf.columns:
+            if "attr" in col.lower() or "type" in col.lower():
+                used_field = col
+                print(f"  Using fallback attribute field: '{used_field}'", flush=True)
+                break
+    if used_field is None:
+        used_field = attribute_field  # keep original, will produce class 5
+
     # Parse Cowardin codes and assign class IDs
     shapes = []
     for _, row in gdf.iterrows():
-        code = row.get(attribute_field, None)
+        code = row.get(used_field, None)
         class_id = _parse_nwi_code(code)
         if class_id > 0 and row.geometry is not None:
             shapes.append((row.geometry, class_id))

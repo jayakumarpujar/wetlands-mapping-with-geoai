@@ -342,15 +342,14 @@ def run_weak_labels(
     composite_for_tiles = training_composite or composite_result["composite_paths"][0]
 
     # Reclassify NWI to Cowardin classes (use same grid as training composite)
+    # Always regenerate — ensures alignment with current training composite
     nwi_raster_path = str(composites_dir / "nwi_raster.tif")
-    if not Path(nwi_raster_path).exists():
-        reclassify_nwi(
-            nwi_path=download_result["nwi_path"],
-            raster_template=composite_for_tiles,
-            output_path=nwi_raster_path,
-        )
-    else:
-        print("  NWI raster already exists, reusing.", flush=True)
+    reclassify_nwi(
+        nwi_path=download_result["nwi_path"],
+        raster_template=composite_for_tiles,
+        output_path=nwi_raster_path,
+        overwrite=True,
+    )
 
     # Generate weak labels with depression + temporal filtering
     # Always regenerate — thresholds may have changed between runs
