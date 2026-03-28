@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
+
 from research_paper.wetland import (
     COWARDIN_CLASSES,
     EXPERIMENT_DEFAULTS,
@@ -191,8 +193,78 @@ def run_composites(
         )
         composite_paths.append(composite_path)
 
+    # Build the 10-band training composite matching the research design:
+    # Bands: NAIP_2015(R,G,B,NIR) + NDVI_2015 + NDWI_2015 + NDVI_2017 + NDWI_2017 + DEM + Depression
+    # This stacks the primary epoch's NAIP with temporal indices from both
+    # epochs plus topographic features into a single training input.
+    training_composite_path = str(composites_dir / "training_composite.tif")
+
+    if len(ndvi_paths) >= 2 and len(ndwi_paths) >= 2:
+        import rasterio
+        from rasterio.warp import Resampling, reproject
+
+        # Use the first year's NAIP as the spatial reference
+        first_naip = naip_files[sorted(naip_files.keys())[0]][0]
+        with rasterio.open(first_naip) as ref_src:
+            ref_profile = ref_src.profile.copy()
+            ref_transform = ref_src.transform
+            ref_crs = ref_src.crs
+            ref_h, ref_w = ref_src.height, ref_src.width
+
+            # Bands 1-4: NAIP (R, G, B, NIR)
+            bands = [ref_src.read(b).astype(np.float32) for b in range(1, min(ref_src.count, 4) + 1)]
+
+        # Helper to read a raster aligned to the reference grid
+        def _read_aligned(path):
+            with rasterio.open(path) as src:
+                if (src.height, src.width) != (ref_h, ref_w) or src.crs != ref_crs:
+                    arr = np.empty((ref_h, ref_w), dtype=np.float32)
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=arr,
+                        dst_transform=ref_transform,
+                        dst_crs=ref_crs,
+                        resampling=Resampling.bilinear,
+                    )
+                    return arr
+                return src.read(1).astype(np.float32)
+
+        # Bands 5-6: NDVI and NDWI from first epoch
+        bands.append(_read_aligned(ndvi_paths[0]))
+        bands.append(_read_aligned(ndwi_paths[0]))
+
+        # Bands 7-8: NDVI and NDWI from second epoch
+        bands.append(_read_aligned(ndvi_paths[1]))
+        bands.append(_read_aligned(ndwi_paths[1]))
+
+        # Band 9: DEM elevation
+        bands.append(_read_aligned(dem_path))
+
+        # Band 10: Depression depth
+        bands.append(_read_aligned(depression_path))
+
+        ref_profile.update(dtype="float32", count=len(bands), nodata=None)
+        with rasterio.open(training_composite_path, "w", **ref_profile) as dst:
+            for i, band in enumerate(bands, start=1):
+                dst.write(band, i)
+
+        print(
+            f"  Created {len(bands)}-band training composite -> {training_composite_path}",
+            flush=True,
+        )
+    elif composite_paths:
+        # Fallback: single epoch — use that composite directly
+        training_composite_path = composite_paths[0]
+        print(
+            f"  Single epoch: using {training_composite_path} as training composite",
+            flush=True,
+        )
+    else:
+        training_composite_path = None
+
     return {
         "composite_paths": composite_paths,
+        "training_composite_path": training_composite_path,
         "ndvi_paths": ndvi_paths,
         "ndwi_paths": ndwi_paths,
         "depression_path": depression_path,
@@ -209,17 +281,20 @@ def run_weak_labels(
     composites_dir = Path(paths["composites_dir"])
     tiles_dir = paths["tiles_dir"]
 
-    if not composite_result["composite_paths"]:
+    training_composite = composite_result.get("training_composite_path")
+    if not training_composite and not composite_result["composite_paths"]:
         raise RuntimeError(
             "No composite rasters were produced. "
             "Check that NAIP files were downloaded for the configured years."
         )
+    # Use the training composite (10-band) if available, else first per-epoch composite
+    composite_for_tiles = training_composite or composite_result["composite_paths"][0]
 
-    # Reclassify NWI to Cowardin classes
+    # Reclassify NWI to Cowardin classes (use same grid as training composite)
     nwi_raster_path = str(composites_dir / "nwi_raster.tif")
     reclassify_nwi(
         nwi_path=download_result["nwi_path"],
-        raster_template=composite_result["composite_paths"][0],
+        raster_template=composite_for_tiles,
         output_path=nwi_raster_path,
     )
 
@@ -234,15 +309,31 @@ def run_weak_labels(
         output_path=weak_label_path,
     )
 
-    # Export training tiles
+    # Export training tiles from the training composite
     tile_result = export_training_tiles(
-        composite_path=composite_result["composite_paths"][0],
+        composite_path=composite_for_tiles,
         label_path=weak_label_path,
         output_dir=tiles_dir,
         tile_size=config["training"]["tile_size"],
     )
 
-    logger.info("Exported %d training tiles.", tile_result["num_tiles"])
+    num_tiles = tile_result["num_tiles"]
+    if num_tiles == 0:
+        raise RuntimeError(
+            "No training tiles were generated. Check that NWI covers the study area "
+            "and that depression/stability thresholds are not too strict."
+        )
+
+    # Auto-detect actual band count from the training composite
+    import rasterio as _rio
+    with _rio.open(composite_for_tiles) as _src:
+        actual_channels = _src.count
+    config["training"]["in_channels"] = actual_channels
+
+    print(
+        f"  Exported {num_tiles} training tiles ({actual_channels} bands).",
+        flush=True,
+    )
 
     return {
         "nwi_raster_path": nwi_raster_path,
@@ -301,41 +392,47 @@ def run_inference(
     trained_models: List[Dict[str, Any]],
     composite_result: Dict[str, List[str]],
 ) -> List[Dict[str, Any]]:
-    """Phase 4a: Run inference for each model on each epoch composite."""
+    """Phase 4a: Run inference for each model on the training composite.
+
+    The model was trained on the 10-band training composite (NAIP + temporal
+    indices + topography), so inference must use the same band structure.
+    Per-epoch 8-band composites are incompatible with the trained model.
+    """
     paths = config["paths"]
     training = config["training"]
     predictions_dir = Path(paths["predictions_dir"])
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
+    # Use the training composite for inference (same bands as training)
+    training_composite = composite_result.get("training_composite_path")
+    if not training_composite:
+        training_composite = composite_result["composite_paths"][0]
+
     all_predictions = []
     for model_info in trained_models:
-        model_predictions = []
         arch = model_info["architecture"]
         encoder = model_info["encoder_name"]
 
-        for composite_path in composite_result["composite_paths"]:
-            epoch_name = Path(composite_path).stem
-            pred_path = str(
-                predictions_dir / f"pred_{arch}_{encoder}_{epoch_name}.tif"
-            )
+        pred_path = str(
+            predictions_dir / f"pred_{arch}_{encoder}.tif"
+        )
 
-            print(f"  Predicting {epoch_name} with {arch} ...", flush=True)
-            predict_wetlands(
-                model_path=model_info["model_path"],
-                composite_path=composite_path,
-                output_path=pred_path,
-                architecture=arch,
-                encoder_name=encoder,
-                num_classes=training["num_classes"],
-                in_channels=training["in_channels"],
-                overwrite=True,
-            )
-            model_predictions.append(pred_path)
+        print(f"  Predicting with {arch} ({encoder}) ...", flush=True)
+        predict_wetlands(
+            model_path=model_info["model_path"],
+            composite_path=training_composite,
+            output_path=pred_path,
+            architecture=arch,
+            encoder_name=encoder,
+            num_classes=training["num_classes"],
+            in_channels=training["in_channels"],
+            overwrite=True,
+        )
 
         all_predictions.append(
             {
                 "model_info": model_info,
-                "prediction_paths": model_predictions,
+                "prediction_paths": [pred_path],
             }
         )
 

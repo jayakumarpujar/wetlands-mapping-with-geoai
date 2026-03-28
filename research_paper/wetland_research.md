@@ -291,10 +291,10 @@ Functions implemented in `research_paper/wetland.py`:
 **Experiment script** (`research_paper/run_experiment.py`):
 - [x] `run_ppr_experiment(output_root, overrides)` — end-to-end pipeline orchestration with real-time `print(..., flush=True)` progress for each phase (Colab buffers `logging` output, so explicit flush is required for visibility)
 - [x] `run_data_download(config)` — Phase 1a: NAIP + DEM + NWI download
-- [x] `run_composites(config, download_result)` — Phase 1b: indices, depressions, composites with separate NDVI/NDWI extraction
-- [x] `run_weak_labels(config, download_result, composite_result)` — Phase 2: NWI reclassification + temporal filtering + tiles
-- [x] `run_training(config, label_result)` — Phase 3: multi-architecture training
-- [x] `run_inference(config, trained_models, composite_result)` — Phase 4a: sliding-window prediction
+- [x] `run_composites(config, download_result)` — Phase 1b: indices, depressions, per-epoch composites, **plus 10-band training composite** stacking NAIP(4) + NDVI/NDWI(2015) + NDVI/NDWI(2017) + DEM + depression; auto-reprojects all bands to NAIP grid
+- [x] `run_weak_labels(config, download_result, composite_result)` — Phase 2: NWI reclassification + temporal filtering + tiles from training composite; validates composite/label shape match; auto-detects `in_channels` from tile band count; raises on zero tiles
+- [x] `run_training(config, label_result)` — Phase 3: multi-architecture training; prints GPU/CPU device; warns if CUDA unavailable
+- [x] `run_inference(config, trained_models, composite_result)` — Phase 4a: predicts on training composite (same 10-band structure as training); per-epoch composites are 8-band and incompatible with trained model
 - [x] `run_evaluation(config, all_predictions, label_result)` — Phase 4b: accuracy + dynamics
 - [x] CLI with `--output-root`, `--num-epochs`, `--batch-size`, `--learning-rate`, `--verbose` flags
 
@@ -331,6 +331,13 @@ Remaining paper tasks (manual execution):
 | 2026-03-26 | Separate NDVI/NDWI extraction for temporal filtering | run_composites writes single-band NDVI and NDWI files from multi-band indices raster; prevents generate_weak_labels from reading NDVI band as NDWI |
 | 2026-03-26 | 10 input channels for experiment | 4 NAIP bands + NDVI + NDWI (2015) + NDVI + NDWI (2017) + elevation + depression depth = 10 channels; matches study-area-specific multi-temporal stack |
 | 2026-03-27 | Flushed print progress in run_experiment | Colab buffers `logging` output for long-running cells; replaced `logger.info` with `print(..., flush=True)` in `run_ppr_experiment` so users see phase timing (e.g. `[120s] Phase 3: Training models ...`) in real-time |
+| 2026-03-27 | 10-band training composite | Per-epoch composites are 8 bands (NAIP+NDVI+NDWI+DEM+dep); training needs 10 bands matching the design (4 NAIP + 4 temporal indices + DEM + depression); `run_composites` now builds a dedicated training composite by stacking aligned bands from both epochs |
+| 2026-03-27 | Inference uses training composite | Model trained on 10-band composite cannot predict on 8-band per-epoch composites; `run_inference` now uses `training_composite_path` for all predictions; dynamics mapping deferred until per-epoch 10-band composites are supported |
+| 2026-03-27 | Auto-detect in_channels from tiles | `in_channels` config is overridden at runtime by reading the actual band count from the training composite; prevents mismatch between config (10) and reality if band count changes |
+| 2026-03-27 | Shape validation in tile export | `export_training_tiles` now raises `ValueError` if composite and label rasters have different shapes; prevents silent misalignment that wastes 45+ min before failing |
+| 2026-03-27 | Raster alignment in generate_weak_labels | Depression, NDVI, and NDWI rasters are reprojected to match NWI raster grid when shapes/CRS differ; DEM covers full bbox while NAIP tiles cover smaller areas |
+| 2026-03-27 | NAIP 4-band validation | `create_wetland_composite` validates NAIP files have at least 4 bands (R,G,B,NIR); reads only first 4 bands to avoid including extra bands from some providers |
+| 2026-03-27 | GPU availability warning | `train_wetland_model` prints explicit warning when CUDA is unavailable, directing user to enable GPU in Colab runtime settings |
 
 ---
 

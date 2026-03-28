@@ -968,6 +968,11 @@ def create_wetland_composite(
 
     # Use the first NAIP file as the spatial reference
     with rasterio.open(naip_paths[0]) as ref_src:
+        if ref_src.count < 4:
+            raise ValueError(
+                f"NAIP file has {ref_src.count} bands, expected at least 4 "
+                f"(R, G, B, NIR): {naip_paths[0]}"
+            )
         ref_profile = ref_src.profile.copy()
         ref_transform = ref_src.transform
         ref_crs = ref_src.crs
@@ -976,8 +981,13 @@ def create_wetland_composite(
 
     for naip_path in naip_paths:
         with rasterio.open(naip_path) as src:
-            # Read NAIP bands (R, G, B, NIR)
-            for b in range(1, src.count + 1):
+            if src.count < 4:
+                raise ValueError(
+                    f"NAIP file has {src.count} bands, expected at least 4 "
+                    f"(R, G, B, NIR): {naip_path}"
+                )
+            # Read NAIP bands (R, G, B, NIR) — only first 4
+            for b in range(1, 5):
                 all_bands.append(src.read(b).astype(np.float32))
 
             # Compute spectral indices
@@ -998,8 +1008,10 @@ def create_wetland_composite(
             destination=dem_data,
             src_transform=dem_src.transform,
             src_crs=dem_src.crs,
+            src_nodata=dem_src.nodata,
             dst_transform=ref_transform,
             dst_crs=ref_crs,
+            dst_nodata=0.0,
             resampling=Resampling.bilinear,
         )
         all_bands.append(dem_data)
@@ -1018,8 +1030,10 @@ def create_wetland_composite(
                 destination=dep_reproj,
                 src_transform=dem_src.transform,
                 src_crs=dem_src.crs,
+                src_nodata=0.0,
                 dst_transform=ref_transform,
                 dst_crs=ref_crs,
+                dst_nodata=0.0,
                 resampling=Resampling.bilinear,
             )
             all_bands.append(dep_reproj)
@@ -1245,14 +1259,15 @@ def generate_weak_labels(
     with rasterio.open(depression_path) as src:
         dep_nodata = src.nodata
         # Reproject/resample depression to match NWI raster grid if shapes differ
-        if (src.height, src.width) != ref_shape:
+        if (src.height, src.width) != ref_shape or src.crs != ref_crs:
             dep_data = np.empty(ref_shape, dtype=np.float64)
             reproject(
                 source=rasterio.band(src, 1),
                 destination=dep_data,
+                src_nodata=dep_nodata,
                 dst_transform=ref_transform,
                 dst_crs=ref_crs,
-                dst_nodata=dep_nodata,
+                dst_nodata=dep_nodata if dep_nodata is not None else -9999,
                 resampling=Resampling.bilinear,
             )
         else:
@@ -1399,6 +1414,12 @@ def export_training_tiles(
     tile_count = 0
 
     with rasterio.open(composite_path) as comp_src, rasterio.open(label_path) as lbl_src:
+        if comp_src.height != lbl_src.height or comp_src.width != lbl_src.width:
+            raise ValueError(
+                f"Shape mismatch between composite ({comp_src.height}x{comp_src.width}) "
+                f"and labels ({lbl_src.height}x{lbl_src.width}). "
+                "Both must use the same spatial grid."
+            )
         height = comp_src.height
         width = comp_src.width
 
@@ -1590,12 +1611,23 @@ def train_wetland_model(
 
     # --- Resolve device ---
     if device is None:
-        resolved_device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        has_cuda = torch.cuda.is_available()
+        resolved_device = torch.device("cuda" if has_cuda else "cpu")
+        if not has_cuda:
+            print(
+                "WARNING: CUDA not available — training on CPU will be very slow. "
+                "Enable GPU: Runtime > Change runtime type > T4 GPU",
+                flush=True,
+            )
     else:
         resolved_device = torch.device(device)
 
+    print(
+        f"  Training: arch={architecture}, encoder={encoder_name}, "
+        f"classes={num_classes}, channels={in_channels}, "
+        f"epochs={num_epochs}, device={resolved_device}",
+        flush=True,
+    )
     logger.info(
         "Training wetland model: arch=%s, encoder=%s, classes=%d, "
         "channels=%d, epochs=%d, device=%s",
