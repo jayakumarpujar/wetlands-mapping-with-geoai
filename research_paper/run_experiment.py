@@ -177,13 +177,16 @@ def run_composites(
         }
 
     # Extract surface depressions from DEM
-    logger.info("Extracting surface depressions ...")
     depression_path = str(composites_dir / "depression_depth.tif")
-    extract_surface_depressions(
-        dem_path=dem_path,
-        output_path=depression_path,
-        min_depth=config["training"].get("depression_min_depth", 0.1),
-    )
+    if Path(depression_path).exists():
+        print("  Depression raster already exists, reusing.", flush=True)
+    else:
+        logger.info("Extracting surface depressions ...")
+        extract_surface_depressions(
+            dem_path=dem_path,
+            output_path=depression_path,
+            min_depth=config["training"].get("depression_min_depth", 0.1),
+        )
 
     # Build per-epoch composites
     composite_paths = []
@@ -200,37 +203,43 @@ def run_composites(
 
         # Compute spectral indices (multi-band: NDVI=band1, NDWI=band2)
         indices_path = str(composites_dir / f"indices_{year}.tif")
-        compute_spectral_indices(
-            naip_path=naip_path,
-            output_path=indices_path,
-        )
-
-        # Extract single-band NDVI and NDWI for temporal stability filtering
-        import rasterio
-
         ndvi_path = str(composites_dir / f"ndvi_{year}.tif")
         ndwi_path = str(composites_dir / f"ndwi_{year}.tif")
-        with rasterio.open(indices_path) as src:
-            profile = src.profile.copy()
-            profile.update(count=1)
-            ndvi_data = src.read(1)
-            ndwi_data = src.read(2)
-            with rasterio.open(ndvi_path, "w", **profile) as dst:
-                dst.write(ndvi_data, 1)
-            with rasterio.open(ndwi_path, "w", **profile) as dst:
-                dst.write(ndwi_data, 1)
+
+        if Path(ndvi_path).exists() and Path(ndwi_path).exists():
+            print(f"  Indices for {year} already exist, reusing.", flush=True)
+        else:
+            compute_spectral_indices(
+                naip_path=naip_path,
+                output_path=indices_path,
+            )
+            # Extract single-band NDVI and NDWI for temporal stability filtering
+            import rasterio
+
+            with rasterio.open(indices_path) as src:
+                profile = src.profile.copy()
+                profile.update(count=1)
+                ndvi_data = src.read(1)
+                ndwi_data = src.read(2)
+                with rasterio.open(ndvi_path, "w", **profile) as dst:
+                    dst.write(ndvi_data, 1)
+                with rasterio.open(ndwi_path, "w", **profile) as dst:
+                    dst.write(ndwi_data, 1)
 
         ndvi_paths.append(ndvi_path)
         ndwi_paths.append(ndwi_path)
 
         # Create multi-band composite
         composite_path = str(composites_dir / f"composite_{year}.tif")
-        create_wetland_composite(
-            naip_paths=[naip_path],
-            dem_path=dem_path,
-            output_path=composite_path,
-            include_depressions=True,
-        )
+        if Path(composite_path).exists():
+            print(f"  Composite for {year} already exists, reusing.", flush=True)
+        else:
+            create_wetland_composite(
+                naip_paths=[naip_path],
+                dem_path=dem_path,
+                output_path=composite_path,
+                include_depressions=True,
+            )
         composite_paths.append(composite_path)
 
     # Build the 10-band training composite matching the research design:
@@ -239,7 +248,9 @@ def run_composites(
     # epochs plus topographic features into a single training input.
     training_composite_path = str(composites_dir / "training_composite.tif")
 
-    if len(ndvi_paths) >= 2 and len(ndwi_paths) >= 2:
+    if Path(training_composite_path).exists():
+        print("  Training composite already exists, reusing.", flush=True)
+    elif len(ndvi_paths) >= 2 and len(ndwi_paths) >= 2:
         import rasterio
         from rasterio.warp import Resampling, reproject
 
