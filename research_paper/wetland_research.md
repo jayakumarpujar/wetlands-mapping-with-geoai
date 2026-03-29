@@ -346,6 +346,9 @@ Remaining paper tasks (manual execution):
 | 2026-03-28 | Geometry repair after reprojection | `make_valid()` applied after `to_crs()` in `reclassify_nwi`; invalid geometries silently break both `intersects()` and `rasterize()` |
 | 2026-03-28 | NAIP mosaic (not single tile) | `run_composites` now mosaics ALL NAIP tiles per year via `rasterio.merge` before computing indices/composites; single tile covered ~5x8 km with zero wetlands out of a 13,700 km² study area |
 | 2026-03-28 | Mosaic marker file | `.mosaic_complete` sentinel file distinguishes mosaicked composites from stale single-tile versions; prevents resume logic from reusing wrong composites |
+| 2026-03-29 | Gate all cache on mosaic marker | Stale `naip_mosaic_{year}.tif` from pre-mosaic runs survived file cleanup; all intermediate cache (mosaics, indices, composites) now requires `.mosaic_complete` marker before reuse |
+| 2026-03-29 | Chunked/windowed raster I/O | 109050×22640 mosaic (40 GB float32) caused OOM even on A100 + 100 GB RAM; `compute_spectral_indices`, training composite builder, and NDVI/NDWI split now use 512-1024 row window chunks, keeping peak RAM at ~1-2 GB |
+| 2026-03-29 | Skip per-year composite | Per-year `composite_{year}.tif` (8-band) is unused when 2+ epochs produce the 10-band training composite; skipping avoids another 40+ GB memory spike per year |
 
 ---
 
@@ -406,7 +409,27 @@ Remaining paper tasks (manual execution):
 - **Time wasted**: ~3+ hours across multiple Colab runs (1.5 hrs composites + repeated debugging)
 - **Insight**: For multi-tile study areas, ALWAYS mosaic before analysis. A single tile provides no guarantees about label coverage. This was the root cause behind all the "0 labeled pixels" failures — every other fix (thresholds, geometry repair, attribute detection) was necessary but insufficient without full spatial coverage
 
-### 7.9 Summary of Colab Resource Usage
+### 7.9 Stale Mosaic Cache Reuse (2026-03-29)
+- **Symptom**: After `git pull` with mosaic fix, pipeline still shows `NWI: 0 polygons within template extent` and template grid is 5340×7580 (single-tile size, not full mosaic)
+- **Root cause**: User deleted `.mosaic_complete` marker and `training_composite.tif` but **not** `naip_mosaic_2015.tif` / `naip_mosaic_2017.tif`. These stale files were single-tile copies from before the mosaic code existed. The reuse check `Path(mosaic_path).exists()` passed, so no real mosaic was built
+- **Fix**: All cache reuse checks (mosaics, indices, per-year composites) now require `.mosaic_complete` marker to exist. Without the marker, everything is rebuilt from scratch regardless of which files survived
+- **Insight**: Cache invalidation must be atomic — partial cleanup (deleting some files but not others) creates inconsistent state. Gate all intermediate products on a single completion marker
+
+### 7.10 OOM Crash on A100 + 100 GB RAM (2026-03-29)
+- **Symptom**: Colab runtime silently crashes/restarts during "Computing indices for 2015" — no error message, just kernel restart
+- **Root cause**: The NAIP mosaic is 109,050×22,640 pixels × 4 bands. Three operations loaded it fully into memory:
+  - `compute_spectral_indices`: 3 bands × float64 = **59 GB** just for input
+  - Training composite: 10 bands × float32 = **99 GB** stacked in a list
+  - Per-year composite: another full load + DEM reproject
+- **Fix**: Rewrote all three operations with **windowed/chunked I/O** using `rasterio.windows.Window`:
+  - `compute_spectral_indices`: 1024-row chunks, processes 3 bands per chunk (~0.7 GB peak)
+  - Training composite: 512-row chunks, writes band-by-band per chunk (~1-2 GB peak)
+  - NDVI/NDWI split: chunked window copy instead of full-band read
+  - Skipped per-year composite entirely (unused when 2+ epochs available)
+- **Time wasted**: ~2 hours across 2 Colab runs (one on T4/50 GB, one on A100/100 GB)
+- **Insight**: For study-area-scale mosaics, NEVER hold full rasters in memory. Always use windowed I/O. The threshold is roughly 10,000×10,000 pixels (~0.4 GB per band) — anything larger must be chunked
+
+### 7.11 Summary of Colab Resource Usage
 
 | Run | Duration | Outcome | Root Cause |
 |-----|----------|---------|------------|
@@ -416,11 +439,27 @@ Remaining paper tasks (manual execution):
 | 4 | ~30 sec | 0 NWI pixels, crash | Stale cached files from run 3 |
 | 5 | ~30 sec | 0 NWI pixels, crash | Invalid geometries after reprojection |
 | 6 | ~30 sec | 0 NWI pixels, crash | Single tile — no wetlands in footprint |
-| 7 | Pending | Rebuilding with mosaic | Full study area coverage |
+| 7 | ~1.3 hrs | 0 NWI pixels, crash | Stale mosaic cache (single-tile files reused) |
+| 8 | ~15 min | OOM crash (kernel restart) | 109k×22k mosaic loaded fully into memory (59-99 GB) |
+| 9 | Pending | Chunked I/O rebuild | Windowed processing, ~1-2 GB peak RAM |
 
-**Total GPU time wasted before mosaic fix: ~2.5+ hours**
+**Total GPU time wasted: ~4+ hours across 8 failed runs**
 
-### 7.10 Lessons Learned
+### 7.12 Estimated Pipeline Runtime (A100 + 120 GB RAM)
+
+| Phase | Step | Estimated Time |
+|-------|------|---------------|
+| 1a | Load data (cached on Drive) | ~15 sec |
+| 1b | Mosaic NAIP (10 tiles/year, 2 years) | ~15-30 min |
+| 1b | Compute indices (chunked, 2 years) | ~20-30 min |
+| 1b | Build 10-band training composite (chunked) | ~15-20 min |
+| 2 | Weak labels + training tiles | ~5-10 min |
+| 3 | Model training (2 architectures) | ~30-60 min |
+| **Total** | | **~1.5-2.5 hours** |
+
+Note: Most time is disk I/O to Google Drive, not GPU compute. Drive latency is highly variable.
+
+### 7.13 Lessons Learned
 
 1. **Mosaic first, analyze second**: Never assume a single tile from a multi-tile download covers the features of interest
 2. **Idempotent pipeline steps**: Every function must handle resume gracefully — check outputs, support `overwrite=True`
@@ -428,6 +467,9 @@ Remaining paper tasks (manual execution):
 4. **Don't transfer thresholds across resolutions**: Igwe's 10m Sentinel-2 thresholds (0.05 stability, 0.5 component fraction) don't work at 1m NAIP — the data characteristics are fundamentally different
 5. **Validate geometry after reprojection**: `make_valid()` is mandatory after `to_crs()` — both geopandas and rasterio silently skip invalid geometries
 6. **Auto-detect, don't hardcode**: Channel counts, attribute fields, CRS parameters — derive from the data at runtime
+7. **Atomic cache invalidation**: Gate all intermediate products on a single completion marker — partial cleanup creates inconsistent state that silently reuses stale data
+8. **Chunked I/O for large rasters**: Any raster >10k×10k pixels must use windowed I/O. Full-band reads of study-area mosaics will OOM even on 100 GB machines
+9. **Pre-download unstable APIs**: 3DEP WMS and USFWS REST APIs frequently timeout on Colab; upload pre-downloaded DEM/NWI tiles to Google Drive instead
 
 ---
 
