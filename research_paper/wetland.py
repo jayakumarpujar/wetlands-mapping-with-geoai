@@ -813,6 +813,12 @@ def compute_spectral_indices(
             dtype="float32",
             count=len(index_names),
             nodata=None,
+            compress="lzw",
+            predictor=2,
+            tiled=True,
+            blockxsize=512,
+            blockysize=512,
+            bigtiff="YES",
         )
 
         # Process in row-chunks to avoid loading the entire raster into memory.

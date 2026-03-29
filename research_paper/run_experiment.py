@@ -219,6 +219,12 @@ def run_composites(
                 width=mosaic_arr.shape[2],
                 transform=mosaic_transform,
                 count=mosaic_arr.shape[0],
+                compress="lzw",
+                predictor=2,
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
+                bigtiff="YES",
             )
             for s in src_files:
                 s.close()
@@ -309,7 +315,17 @@ def run_composites(
         band_sources.append((depression_path, None))
 
         num_bands = len(band_sources)
-        ref_profile.update(dtype="float32", count=num_bands, nodata=None)
+        ref_profile.update(
+            dtype="float32",
+            count=num_bands,
+            nodata=None,
+            compress="lzw",
+            predictor=2,
+            tiled=True,
+            blockxsize=512,
+            blockysize=512,
+            bigtiff="YES",
+        )
         chunk_height = max(1, min(512, ref_h))
 
         with rasterio.open(training_composite_path, "w", **ref_profile) as dst:
