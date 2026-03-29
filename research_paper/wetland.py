@@ -1122,14 +1122,30 @@ def reclassify_nwi(
 
     # Reproject NWI to template CRS if needed
     if gdf.crs and not gdf.crs.equals(tmpl_crs):
+        print(f"  Reprojecting NWI from {gdf.crs} to {tmpl_crs} ...", flush=True)
         gdf = gdf.to_crs(tmpl_crs)
 
-    # Clip to template bounds to avoid rasterizing polygons outside the grid
+    nwi_bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
+    print(f"  NWI bounds (reprojected): minx={nwi_bounds[0]:.0f}, miny={nwi_bounds[1]:.0f}, "
+          f"maxx={nwi_bounds[2]:.0f}, maxy={nwi_bounds[3]:.0f}", flush=True)
+    print(f"  Template bounds: left={tmpl_bounds.left:.0f}, bottom={tmpl_bounds.bottom:.0f}, "
+          f"right={tmpl_bounds.right:.0f}, top={tmpl_bounds.top:.0f}", flush=True)
+
+    # Clip to template bounds — use spatial index for speed
     from shapely.geometry import box as shapely_box
     clip_geom = shapely_box(tmpl_bounds.left, tmpl_bounds.bottom,
                             tmpl_bounds.right, tmpl_bounds.top)
-    gdf = gdf[gdf.geometry.intersects(clip_geom)]
-    print(f"  NWI: {len(gdf)} polygons intersect the template extent", flush=True)
+    intersects_mask = gdf.geometry.intersects(clip_geom)
+    n_intersect = int(intersects_mask.sum())
+    print(f"  NWI: {n_intersect} of {len(gdf)} polygons intersect the template extent", flush=True)
+
+    if n_intersect == 0:
+        # Skip clipping — rasterize ALL polygons and let rasterio handle the extent.
+        # This avoids false negatives from geometry precision issues.
+        print("  WARNING: 0 intersections detected — rasterizing all polygons "
+              "(rasterio will clip to template extent)", flush=True)
+    else:
+        gdf = gdf[intersects_mask]
 
     # Try common NWI attribute field names
     attr_candidates = [attribute_field, "ATTRIBUTE", "WETLAND_TYPE", "wetland_type"]
