@@ -1125,55 +1125,71 @@ def reclassify_nwi(
         print(f"  Reprojecting NWI from {gdf.crs} to {tmpl_crs} ...", flush=True)
         gdf = gdf.to_crs(tmpl_crs)
 
+    # Fix invalid geometries created by reprojection
+    from shapely.validation import make_valid
+    invalid_count = int((~gdf.geometry.is_valid).sum())
+    if invalid_count > 0:
+        print(f"  Fixing {invalid_count} invalid geometries after reprojection ...", flush=True)
+        gdf.geometry = gdf.geometry.apply(
+            lambda g: make_valid(g) if g is not None and not g.is_valid else g
+        )
+
     nwi_bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
     print(f"  NWI bounds (reprojected): minx={nwi_bounds[0]:.0f}, miny={nwi_bounds[1]:.0f}, "
           f"maxx={nwi_bounds[2]:.0f}, maxy={nwi_bounds[3]:.0f}", flush=True)
     print(f"  Template bounds: left={tmpl_bounds.left:.0f}, bottom={tmpl_bounds.bottom:.0f}, "
           f"right={tmpl_bounds.right:.0f}, top={tmpl_bounds.top:.0f}", flush=True)
 
-    # Clip to template bounds — use spatial index for speed
+    # Clip NWI to template extent using geopandas clip (robust)
     from shapely.geometry import box as shapely_box
     clip_geom = shapely_box(tmpl_bounds.left, tmpl_bounds.bottom,
                             tmpl_bounds.right, tmpl_bounds.top)
-    intersects_mask = gdf.geometry.intersects(clip_geom)
-    n_intersect = int(intersects_mask.sum())
-    print(f"  NWI: {n_intersect} of {len(gdf)} polygons intersect the template extent", flush=True)
+    try:
+        gdf_clipped = gpd.clip(gdf, clip_geom)
+        n_clipped = len(gdf_clipped)
+        print(f"  NWI: {n_clipped} polygons within template extent (gpd.clip)", flush=True)
+        if n_clipped > 0:
+            gdf = gdf_clipped
+    except Exception as clip_err:
+        print(f"  WARNING: gpd.clip failed ({clip_err}), using all polygons", flush=True)
 
-    if n_intersect == 0:
-        # Skip clipping — rasterize ALL polygons and let rasterio handle the extent.
-        # This avoids false negatives from geometry precision issues.
-        print("  WARNING: 0 intersections detected — rasterizing all polygons "
-              "(rasterio will clip to template extent)", flush=True)
-    else:
-        gdf = gdf[intersects_mask]
-
-    # Try common NWI attribute field names
-    attr_candidates = [attribute_field, "ATTRIBUTE", "WETLAND_TYPE", "wetland_type"]
+    # Detect attribute field — NWI REST API prefixes with 'Wetlands.'
+    attr_candidates = [
+        attribute_field,
+        f"Wetlands.{attribute_field}",
+        "ATTRIBUTE",
+        "Wetlands.ATTRIBUTE",
+        "WETLAND_TYPE",
+        "Wetlands.WETLAND_TYPE",
+    ]
     used_field = None
     for candidate in attr_candidates:
         if candidate in gdf.columns:
             used_field = candidate
             break
-    if used_field is None and len(gdf.columns) > 1:
-        # Show available columns so the user can identify the right one
-        print(f"  WARNING: '{attribute_field}' not found. "
-              f"Available columns: {list(gdf.columns)}", flush=True)
-        # Fallback: check for any column containing 'attr' or 'type'
+    if used_field is None:
+        # Fallback: any column containing 'attr' or 'type'
         for col in gdf.columns:
             if "attr" in col.lower() or "type" in col.lower():
                 used_field = col
-                print(f"  Using fallback attribute field: '{used_field}'", flush=True)
                 break
     if used_field is None:
-        used_field = attribute_field  # keep original, will produce class 5
+        used_field = attribute_field
+    print(f"  Using attribute field: '{used_field}'", flush=True)
+
+    # Show sample values
+    sample_vals = gdf[used_field].dropna().head(5).tolist() if used_field in gdf.columns else []
+    print(f"  Sample NWI codes: {sample_vals}", flush=True)
 
     # Parse Cowardin codes and assign class IDs
     shapes = []
     for _, row in gdf.iterrows():
         code = row.get(used_field, None)
         class_id = _parse_nwi_code(code)
-        if class_id > 0 and row.geometry is not None:
+        if class_id > 0 and row.geometry is not None and not row.geometry.is_empty:
             shapes.append((row.geometry, class_id))
+
+    print(f"  Rasterizing {len(shapes)} shapes into {tmpl_width}x{tmpl_height} grid ...", flush=True)
 
     # Rasterize
     if shapes:
@@ -1187,6 +1203,10 @@ def reclassify_nwi(
         )
     else:
         out_arr = np.zeros((tmpl_height, tmpl_width), dtype=np.uint8)
+
+    n_labeled = int(np.sum(out_arr > 0))
+    unique_classes = np.unique(out_arr[out_arr > 0]).tolist()
+    print(f"  Rasterized: {n_labeled} labeled pixels, classes: {unique_classes}", flush=True)
 
     profile = {
         "driver": "GTiff",
