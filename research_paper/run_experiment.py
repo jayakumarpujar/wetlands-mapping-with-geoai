@@ -157,7 +157,15 @@ def run_composites(
     naip_files = download_result["naip_files"]
     years = sorted(naip_files.keys())
 
-    training_composite_path = str(composites_dir / "training_composite.tif")
+    # Large intermediates (training composite) go to local disk when available
+    # to avoid GDAL write failures on Google Drive FUSE mounts for >4 GB files.
+    # The mosaic marker and tile outputs stay on Drive for persistence.
+    _local_cache = Path("/content/wetlands_local")
+    if _local_cache.parent.exists():  # /content/ exists → we're on Colab
+        _local_cache.mkdir(parents=True, exist_ok=True)
+        training_composite_path = str(_local_cache / "training_composite.tif")
+    else:
+        training_composite_path = str(composites_dir / "training_composite.tif")
     depression_path = str(composites_dir / "depression_depth.tif")
     # Check for the mosaic marker — old single-tile composites must be rebuilt
     mosaic_marker = composites_dir / ".mosaic_complete"
