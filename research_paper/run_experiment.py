@@ -248,32 +248,27 @@ def run_composites(
                 output_path=indices_path,
                 overwrite=True,
             )
+            # Split indices into separate files using windowed I/O
+            from rasterio.windows import Window as _Win
             with rasterio.open(indices_path) as src:
                 profile = src.profile.copy()
                 profile.update(count=1)
-                ndvi_data = src.read(1)
-                ndwi_data = src.read(2)
-                with rasterio.open(ndvi_path, "w", **profile) as dst:
-                    dst.write(ndvi_data, 1)
-                with rasterio.open(ndwi_path, "w", **profile) as dst:
-                    dst.write(ndwi_data, 1)
+                _ch = max(1, min(1024, src.height))
+                with rasterio.open(ndvi_path, "w", **profile) as dv, \
+                     rasterio.open(ndwi_path, "w", **profile) as dw:
+                    for _ro in range(0, src.height, _ch):
+                        _h = min(_ch, src.height - _ro)
+                        _w = _Win(0, _ro, src.width, _h)
+                        dv.write(src.read(1, window=_w), 1, window=_w)
+                        dw.write(src.read(2, window=_w), 1, window=_w)
 
         ndvi_paths.append(ndvi_path)
         ndwi_paths.append(ndwi_path)
 
-        # Create multi-band composite from mosaic
+        # Per-year composite is only needed as fallback when < 2 epochs.
+        # Skip it when we have multiple years — the 10-band training composite
+        # is built directly below and avoids loading the full mosaic twice.
         composite_path = str(composites_dir / f"composite_{year}.tif")
-        if Path(composite_path).exists() and mosaic_marker.exists():
-            print(f"  Composite for {year} already exists, reusing.", flush=True)
-        else:
-            print(f"  Creating composite for {year} ...", flush=True)
-            create_wetland_composite(
-                naip_paths=[mosaic_path],
-                dem_path=dem_path,
-                output_path=composite_path,
-                include_depressions=True,
-                overwrite=True,
-            )
         composite_paths.append(composite_path)
 
     # Build the 10-band training composite matching the research design:
@@ -286,6 +281,7 @@ def run_composites(
         print("  Training composite already exists, reusing.", flush=True)
     elif len(ndvi_paths) >= 2 and len(ndwi_paths) >= 2:
         print("  Building 10-band training composite from mosaics ...", flush=True)
+        from rasterio.windows import Window
 
         # Use the first year's MOSAIC as the spatial reference (full study area)
         first_year = sorted(naip_files.keys())[0]
@@ -296,42 +292,47 @@ def run_composites(
             ref_crs = ref_src.crs
             ref_h, ref_w = ref_src.height, ref_src.width
 
-            # Bands 1-4: NAIP (R, G, B, NIR)
-            bands = [ref_src.read(b).astype(np.float32) for b in range(1, min(ref_src.count, 4) + 1)]
-
-        # Helper to read a raster aligned to the reference grid
-        def _read_aligned(path):
-            with rasterio.open(path) as src:
-                if (src.height, src.width) != (ref_h, ref_w) or src.crs != ref_crs:
-                    arr = np.empty((ref_h, ref_w), dtype=np.float32)
-                    reproject(
-                        source=rasterio.band(src, 1),
-                        destination=arr,
-                        dst_transform=ref_transform,
-                        dst_crs=ref_crs,
-                        resampling=Resampling.bilinear,
-                    )
-                    return arr
-                return src.read(1).astype(np.float32)
-
+        # Band sources: (path, band_index) — band_index=None means single-band file
+        band_sources = []
+        # Bands 1-4: NAIP (R, G, B, NIR) from first mosaic
+        for b in range(1, 5):
+            band_sources.append((first_mosaic, b))
         # Bands 5-6: NDVI and NDWI from first epoch
-        bands.append(_read_aligned(ndvi_paths[0]))
-        bands.append(_read_aligned(ndwi_paths[0]))
-
+        band_sources.append((ndvi_paths[0], None))
+        band_sources.append((ndwi_paths[0], None))
         # Bands 7-8: NDVI and NDWI from second epoch
-        bands.append(_read_aligned(ndvi_paths[1]))
-        bands.append(_read_aligned(ndwi_paths[1]))
-
+        band_sources.append((ndvi_paths[1], None))
+        band_sources.append((ndwi_paths[1], None))
         # Band 9: DEM elevation
-        bands.append(_read_aligned(dem_path))
-
+        band_sources.append((dem_path, None))
         # Band 10: Depression depth
-        bands.append(_read_aligned(depression_path))
+        band_sources.append((depression_path, None))
 
-        ref_profile.update(dtype="float32", count=len(bands), nodata=None)
+        num_bands = len(band_sources)
+        ref_profile.update(dtype="float32", count=num_bands, nodata=None)
+        chunk_height = max(1, min(512, ref_h))
+
         with rasterio.open(training_composite_path, "w", **ref_profile) as dst:
-            for i, band in enumerate(bands, start=1):
-                dst.write(band, i)
+            for row_off in range(0, ref_h, chunk_height):
+                h = min(chunk_height, ref_h - row_off)
+                win = Window(0, row_off, ref_w, h)
+                dst_transform = rasterio.windows.transform(win, ref_transform)
+
+                for out_band, (src_path, src_band_idx) in enumerate(band_sources, start=1):
+                    with rasterio.open(src_path) as src:
+                        bi = src_band_idx or 1
+                        if (src.height, src.width) != (ref_h, ref_w) or src.crs != ref_crs:
+                            arr = np.empty((h, ref_w), dtype=np.float32)
+                            reproject(
+                                source=rasterio.band(src, bi),
+                                destination=arr,
+                                dst_transform=dst_transform,
+                                dst_crs=ref_crs,
+                                resampling=Resampling.bilinear,
+                            )
+                        else:
+                            arr = src.read(bi, window=win).astype(np.float32)
+                    dst.write(arr, out_band, window=win)
 
         # Mark that this composite was built from mosaics (not single tiles)
         mosaic_marker.touch()

@@ -805,13 +805,9 @@ def compute_spectral_indices(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    from rasterio.windows import Window
+
     with rasterio.open(naip_path) as src:
-        red = src.read(1).astype(np.float64)
-        green = src.read(2).astype(np.float64)
-        nir = src.read(4).astype(np.float64)
-
-        bands_dict = {"red": red, "green": green, "nir": nir}
-
         profile = src.profile.copy()
         profile.update(
             dtype="float32",
@@ -819,10 +815,23 @@ def compute_spectral_indices(
             nodata=None,
         )
 
+        # Process in row-chunks to avoid loading the entire raster into memory.
+        # Each chunk: 3 bands * width * chunk_height * 8 bytes (float64).
+        chunk_height = max(1, min(1024, src.height))
+
         with rasterio.open(output_path, "w", **profile) as dst:
-            for i, name in enumerate(index_names, start=1):
-                result = _compute_index(name, bands_dict)
-                dst.write(result.astype(np.float32), i)
+            for row_off in range(0, src.height, chunk_height):
+                h = min(chunk_height, src.height - row_off)
+                win = Window(0, row_off, src.width, h)
+
+                red = src.read(1, window=win).astype(np.float64)
+                green = src.read(2, window=win).astype(np.float64)
+                nir = src.read(4, window=win).astype(np.float64)
+                bands_dict = {"red": red, "green": green, "nir": nir}
+
+                for i, name in enumerate(index_names, start=1):
+                    result = _compute_index(name, bands_dict)
+                    dst.write(result.astype(np.float32), i, window=win)
 
     logger.info("Computed %s -> %s", index_names, output_path)
     return str(output_path)
