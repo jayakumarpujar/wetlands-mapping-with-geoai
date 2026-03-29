@@ -206,8 +206,9 @@ def run_composites(
 
         # Mosaic all NAIP tiles for this year into a single raster
         mosaic_path = str(composites_dir / f"naip_mosaic_{year}.tif")
-        if Path(mosaic_path).exists():
-            print(f"  NAIP mosaic for {year} already exists, reusing.", flush=True)
+        if Path(mosaic_path).exists() and mosaic_marker.exists():
+            with rasterio.open(mosaic_path) as _ms:
+                print(f"  NAIP mosaic for {year} already exists ({_ms.width}x{_ms.height}), reusing.", flush=True)
         else:
             print(f"  Mosaicking {len(year_files)} NAIP tiles for {year} ...", flush=True)
             src_files = [rasterio.open(f) for f in year_files]
@@ -238,7 +239,7 @@ def run_composites(
                     print(f"  Indices for {year} are stale (wrong size), recomputing.", flush=True)
                     indices_stale = True
 
-        if Path(ndvi_path).exists() and Path(ndwi_path).exists() and not indices_stale:
+        if Path(ndvi_path).exists() and Path(ndwi_path).exists() and not indices_stale and mosaic_marker.exists():
             print(f"  Indices for {year} already exist, reusing.", flush=True)
         else:
             print(f"  Computing indices for {year} ...", flush=True)
@@ -262,7 +263,7 @@ def run_composites(
 
         # Create multi-band composite from mosaic
         composite_path = str(composites_dir / f"composite_{year}.tif")
-        if Path(composite_path).exists():
+        if Path(composite_path).exists() and mosaic_marker.exists():
             print(f"  Composite for {year} already exists, reusing.", flush=True)
         else:
             print(f"  Creating composite for {year} ...", flush=True)
