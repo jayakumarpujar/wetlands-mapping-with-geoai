@@ -157,12 +157,12 @@ def run_composites(
     naip_files = download_result["naip_files"]
     years = sorted(naip_files.keys())
 
-    # --- Resume check: if training composite already exists, skip recompute ---
     training_composite_path = str(composites_dir / "training_composite.tif")
     depression_path = str(composites_dir / "depression_depth.tif")
-    if Path(training_composite_path).exists():
-        print("  Training composite already exists, skipping recompute.", flush=True)
-        # Reconstruct result dict from existing files
+    # Check for the mosaic marker — old single-tile composites must be rebuilt
+    mosaic_marker = composites_dir / ".mosaic_complete"
+    if Path(training_composite_path).exists() and mosaic_marker.exists():
+        print("  Training composite (mosaicked) already exists, skipping.", flush=True)
         composite_paths = [str(p) for p in sorted(composites_dir.glob("composite_*.tif"))]
         ndvi_paths = [str(p) for p in sorted(composites_dir.glob("ndvi_*.tif"))]
         ndwi_paths = [str(p) for p in sorted(composites_dir.glob("ndwi_*.tif"))]
@@ -188,7 +188,13 @@ def run_composites(
             min_depth=config["training"].get("depression_min_depth", 0.1),
         )
 
-    # Build per-epoch composites
+    # Build per-epoch NAIP mosaics and indices
+    # IMPORTANT: mosaic ALL tiles per year to cover the full study area.
+    # Using a single tile leaves most wetlands outside the footprint.
+    import rasterio
+    from rasterio.merge import merge as rasterio_merge
+    from rasterio.warp import Resampling, reproject
+
     composite_paths = []
     ndvi_paths = []
     ndwi_paths = []
@@ -198,24 +204,49 @@ def run_composites(
             logger.warning("No NAIP files for year %d, skipping.", year)
             continue
 
-        # Use the first file per year (covers the study area)
-        naip_path = year_files[0]
+        # Mosaic all NAIP tiles for this year into a single raster
+        mosaic_path = str(composites_dir / f"naip_mosaic_{year}.tif")
+        if Path(mosaic_path).exists():
+            print(f"  NAIP mosaic for {year} already exists, reusing.", flush=True)
+        else:
+            print(f"  Mosaicking {len(year_files)} NAIP tiles for {year} ...", flush=True)
+            src_files = [rasterio.open(f) for f in year_files]
+            mosaic_arr, mosaic_transform = rasterio_merge(src_files)
+            mosaic_profile = src_files[0].profile.copy()
+            mosaic_profile.update(
+                height=mosaic_arr.shape[1],
+                width=mosaic_arr.shape[2],
+                transform=mosaic_transform,
+                count=mosaic_arr.shape[0],
+            )
+            for s in src_files:
+                s.close()
+            with rasterio.open(mosaic_path, "w", **mosaic_profile) as dst:
+                dst.write(mosaic_arr)
+            print(f"  Mosaic {year}: {mosaic_arr.shape[2]}x{mosaic_arr.shape[1]} pixels", flush=True)
 
-        # Compute spectral indices (multi-band: NDVI=band1, NDWI=band2)
+        # Compute spectral indices on the mosaic
         indices_path = str(composites_dir / f"indices_{year}.tif")
         ndvi_path = str(composites_dir / f"ndvi_{year}.tif")
         ndwi_path = str(composites_dir / f"ndwi_{year}.tif")
 
-        if Path(ndvi_path).exists() and Path(ndwi_path).exists():
+        # Check if existing indices match the mosaic dimensions
+        indices_stale = False
+        if Path(ndvi_path).exists() and Path(mosaic_path).exists():
+            with rasterio.open(ndvi_path) as idx_src, rasterio.open(mosaic_path) as mos_src:
+                if idx_src.width != mos_src.width or idx_src.height != mos_src.height:
+                    print(f"  Indices for {year} are stale (wrong size), recomputing.", flush=True)
+                    indices_stale = True
+
+        if Path(ndvi_path).exists() and Path(ndwi_path).exists() and not indices_stale:
             print(f"  Indices for {year} already exist, reusing.", flush=True)
         else:
+            print(f"  Computing indices for {year} ...", flush=True)
             compute_spectral_indices(
-                naip_path=naip_path,
+                naip_path=mosaic_path,
                 output_path=indices_path,
+                overwrite=True,
             )
-            # Extract single-band NDVI and NDWI for temporal stability filtering
-            import rasterio
-
             with rasterio.open(indices_path) as src:
                 profile = src.profile.copy()
                 profile.update(count=1)
@@ -229,16 +260,18 @@ def run_composites(
         ndvi_paths.append(ndvi_path)
         ndwi_paths.append(ndwi_path)
 
-        # Create multi-band composite
+        # Create multi-band composite from mosaic
         composite_path = str(composites_dir / f"composite_{year}.tif")
         if Path(composite_path).exists():
             print(f"  Composite for {year} already exists, reusing.", flush=True)
         else:
+            print(f"  Creating composite for {year} ...", flush=True)
             create_wetland_composite(
-                naip_paths=[naip_path],
+                naip_paths=[mosaic_path],
                 dem_path=dem_path,
                 output_path=composite_path,
                 include_depressions=True,
+                overwrite=True,
             )
         composite_paths.append(composite_path)
 
@@ -248,15 +281,15 @@ def run_composites(
     # epochs plus topographic features into a single training input.
     training_composite_path = str(composites_dir / "training_composite.tif")
 
-    if Path(training_composite_path).exists():
+    if Path(training_composite_path).exists() and mosaic_marker.exists():
         print("  Training composite already exists, reusing.", flush=True)
     elif len(ndvi_paths) >= 2 and len(ndwi_paths) >= 2:
-        import rasterio
-        from rasterio.warp import Resampling, reproject
+        print("  Building 10-band training composite from mosaics ...", flush=True)
 
-        # Use the first year's NAIP as the spatial reference
-        first_naip = naip_files[sorted(naip_files.keys())[0]][0]
-        with rasterio.open(first_naip) as ref_src:
+        # Use the first year's MOSAIC as the spatial reference (full study area)
+        first_year = sorted(naip_files.keys())[0]
+        first_mosaic = str(composites_dir / f"naip_mosaic_{first_year}.tif")
+        with rasterio.open(first_mosaic) as ref_src:
             ref_profile = ref_src.profile.copy()
             ref_transform = ref_src.transform
             ref_crs = ref_src.crs
@@ -299,6 +332,8 @@ def run_composites(
             for i, band in enumerate(bands, start=1):
                 dst.write(band, i)
 
+        # Mark that this composite was built from mosaics (not single tiles)
+        mosaic_marker.touch()
         print(
             f"  Created {len(bands)}-band training composite -> {training_composite_path}",
             flush=True,
