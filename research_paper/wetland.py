@@ -458,8 +458,8 @@ def download_naip_timeseries(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    max_retries = kwargs.pop("max_retries", 3)
-    kwargs.pop("timeout", None)
+    max_retries = kwargs.pop("max_retries", 5)
+    timeout = kwargs.pop("timeout", 120)
 
     results: Dict[int, List[str]] = {}
     for year in years:
@@ -477,26 +477,31 @@ def download_naip_timeseries(
                     year=year,
                     max_items=max_items_per_year,
                     overwrite=overwrite,
+                    timeout=timeout,
                     **kwargs,
                 )
                 if files:
                     results[year] = files
                 break
-            except (TimeoutError, OSError, ConnectionError) as exc:
+            except Exception as exc:
                 last_error = exc
                 logger.warning(
-                    "NAIP download for year %d attempt %d/%d failed: %s",
-                    year, attempt, max_retries, exc,
+                    "NAIP download for year %d attempt %d/%d failed (%s): %s",
+                    year, attempt, max_retries, type(exc).__name__, exc,
                 )
                 if attempt < max_retries:
                     import time
-                    wait = min(30, 5 * attempt)
+                    wait = min(60, 10 * attempt)
                     logger.info("Retrying in %ds ...", wait)
                     time.sleep(wait)
         else:
-            raise TimeoutError(
-                f"NAIP download for year {year} failed after "
-                f"{max_retries} attempts"
+            raise RuntimeError(
+                f"NAIP download for year {year} failed after {max_retries} attempts. "
+                f"Last error: {last_error}\n"
+                f"If on HPC, the cluster may be blocking outbound HTTPS to "
+                f"Microsoft Planetary Computer (planetarycomputer.microsoft.com). "
+                f"Pre-download NAIP on a machine with internet access and pass "
+                f"pre_downloaded_naip={{year: [paths]}} in overrides."
             ) from last_error
 
     return results
