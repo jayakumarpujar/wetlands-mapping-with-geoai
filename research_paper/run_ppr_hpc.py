@@ -92,6 +92,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Validation fraction 0-1 (default: 0.2).",
     )
 
+    # --- Pre-uploaded data (skip API downloads) ---
+    data = p.add_argument_group("pre-uploaded data (skip API downloads)")
+    data.add_argument(
+        "--dem-tiles",
+        nargs="+",
+        metavar="FILE",
+        help="Paths to pre-downloaded USGS DEM .tif tiles (skips 3DEP API).",
+    )
+    data.add_argument(
+        "--nwi-path",
+        metavar="FILE",
+        help="Path to pre-downloaded NWI .gpkg or .shp file (skips USFWS API).",
+    )
+
     # --- Logging ---
     p.add_argument(
         "--log-file", metavar="FILE",
@@ -168,6 +182,10 @@ def main() -> None:
         "tile_size": args.tile_size,
         "val_split": args.val_split,
     }
+    if args.dem_tiles:
+        overrides["pre_downloaded_dem_tiles"] = args.dem_tiles
+    if args.nwi_path:
+        overrides["pre_downloaded_nwi"] = args.nwi_path
 
     log.info("Starting experiment ...")
     t0 = time.time()
