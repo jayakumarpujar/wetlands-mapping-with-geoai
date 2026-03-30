@@ -492,6 +492,7 @@ def run_training(
             use_class_weights=training["use_class_weights"],
             val_split=training["val_split"],
             seed=training["seed"],
+            num_workers=training.get("num_workers", 4),
             overwrite=True,
         )
         trained_models.append(

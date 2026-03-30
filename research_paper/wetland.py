@@ -108,6 +108,7 @@ EXPERIMENT_DEFAULTS: Dict[str, Any] = {
     "seed": 42,
     "dem_resolution": 1,
     "depression_min_depth": 0.1,
+    "num_workers": 4,
     "architectures": [
         {"architecture": "unetplusplus", "encoder_name": "resnet50"},
         {"architecture": "deeplabv3plus", "encoder_name": "resnet50"},
