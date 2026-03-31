@@ -441,23 +441,88 @@ Remaining paper tasks (manual execution):
 | 6 | ~30 sec | 0 NWI pixels, crash | Single tile — no wetlands in footprint |
 | 7 | ~1.3 hrs | 0 NWI pixels, crash | Stale mosaic cache (single-tile files reused) |
 | 8 | ~15 min | OOM crash (kernel restart) | 109k×22k mosaic loaded fully into memory (59-99 GB) |
-| 9 | Pending | Chunked I/O rebuild | Windowed processing, ~1-2 GB peak RAM |
+| 9 | ~45 min | BIGTIFF write crash | Missing BIGTIFF=YES + Drive FUSE unreliable for 99 GB files |
 
-**Total GPU time wasted: ~4+ hours across 8 failed runs**
+**Total GPU time wasted: ~4+ hours across 9 failed Colab runs → migrated to HPC**
 
-### 7.12 Estimated Pipeline Runtime (A100 + 120 GB RAM)
+### 7.12 Actual HPC Run — First Successful Composite Build (2026-03-30)
+
+**Environment:** USD John Lab HPC cluster, Volta GPU node (V100), 24-core CPU
+**Output root:** `/home/usd.local/jayakumar.pujar/john_lab/shared/Jay/wetlands_data`
+**Script:** `run_ppr_hpc.py` — all data pre-uploaded, no API downloads needed
+
+| Phase | Step | Actual Time | Notes |
+|-------|------|-------------|-------|
+| 1a | Load data (pre-uploaded) | ~3 sec | NAIP 10+10 tiles, DEM, NWI all reused |
+| 1b | Mosaic 2015 (10 tiles → 109050×22640) | ~6 min | Fast local scratch, no Drive latency |
+| 1b | Compute indices 2015 (chunked) | ~3 min | Windowed I/O, low RAM |
+| 1b | Mosaic 2017 (10 tiles → 32850×35450) | ~3 min | |
+| 1b | Compute indices 2017 (chunked) | ~3 min | |
+| 1b | Build 10-band training composite | ~28 min | 109050×22640×10 bands, LZW compressed |
+| — | **CRASH** | at 43 min | `NameError: name 'bands' is not defined` |
+
+**Crash cause:** `print(f"Created {len(bands)}...")` — variable was renamed to `band_sources`/`num_bands` during refactor but print line was missed.
+**Fix:** `len(bands)` → `num_bands` (commit `9beeaff`)
+**Key insight:** Composite was fully written to disk before crash — pipeline resumes from Phase 2 on next run.
+
+### 7.13 HPC Bugs Fixed (2026-03-30)
+
+| Bug | Symptom | Fix | Commit |
+|-----|---------|-----|--------|
+| `num_workers` not a valid override key | `ValueError: Unknown override keys: {'num_workers'}` | Added `num_workers: 4` to `EXPERIMENT_DEFAULTS`; wired into `train_wetland_model()` call | `1ba5d88` |
+| NAIP download timeout after 51s | 3 retries × ~12s TCP timeout = 51s total | HPC firewall blocks Planetary Computer STAC API — worked around by pre-uploading NAIP tiles | `880d2d3` |
+| `timeout` kwarg silently discarded | Download retried with OS-default TCP timeout | Pass `timeout` through to `download_naip()`; broaden exception catch to `Exception` | `880d2d3` |
+| `--dem-tiles` / `--nwi-path` not available on CLI | No way to point to pre-uploaded files | Added both args to `run_ppr_hpc.py` | `538dce3` |
+| `NameError: name 'bands'` after composite write | Crash on print after successful write | `len(bands)` → `num_bands` | `9beeaff` |
+
+### 7.14 HPC vs Colab Comparison
+
+| Factor | Google Colab (A100) | HPC Volta Node |
+|--------|--------------------|--------------------|
+| RAM | 120 GB | Sufficient (no OOM) |
+| Disk I/O | FUSE mount (slow, unreliable >4 GB) | Fast local scratch — no issues |
+| NAIP mosaic time | ~15-30 min (Drive latency) | ~6 min |
+| Composite write | Failed via FUSE even with BIGTIFF | Succeeded cleanly |
+| Network | Planetary Computer API accessible | Firewall blocks STAC API — pre-upload required |
+| Session limit | 12 hr max, can be interrupted | SLURM job, persistent |
+| **Verdict** | Too unreliable for 99 GB files | **Preferred environment** |
+
+### 7.15 Estimated HPC Runtime (Next Run — Composite Already Built)
 
 | Phase | Step | Estimated Time |
 |-------|------|---------------|
-| 1a | Load data (cached on Drive) | ~15 sec |
-| 1b | Mosaic NAIP (10 tiles/year, 2 years) | ~15-30 min |
-| 1b | Compute indices (chunked, 2 years) | ~20-30 min |
-| 1b | Build 10-band training composite (chunked) | ~15-20 min |
+| 1a | Load pre-uploaded data | ~3 sec |
+| 1b | Skip all (training_composite.tif exists + `.mosaic_complete`) | ~1 sec |
 | 2 | Weak labels + training tiles | ~5-10 min |
-| 3 | Model training (2 architectures) | ~30-60 min |
-| **Total** | | **~1.5-2.5 hours** |
+| 3 | Train U-Net++ + DeepLabV3+ (50 epochs each) | ~30-60 min |
+| 4 | Inference + evaluation | ~10-15 min |
+| **Total** | | **~45-90 min** |
 
-Note: Most time is disk I/O to Google Drive, not GPU compute. Drive latency is highly variable.
+### 7.16 RAM Requirements — Why Training Data Creation is Memory-Intensive
+
+The 10-band training composite creation is the most RAM-intensive step:
+
+| Raster | Dimensions | Uncompressed Size |
+|--------|-----------|-------------------|
+| NAIP mosaic 2015 | 109050 × 22640 × 4 bands (uint8) | ~9.4 GB |
+| NAIP mosaic 2017 | 32850 × 35450 × 4 bands (uint8) | ~4.6 GB |
+| NDVI/NDWI per year | 109050 × 22640 × 1 band (float32) | ~9.4 GB each |
+| DEM (reprojected) | 109050 × 22640 × 1 band (float32) | ~9.4 GB |
+| Depression depth | 109050 × 22640 × 1 band (float32) | ~9.4 GB |
+| **10-band composite** | **109050 × 22640 × 10 bands (float32)** | **~99 GB** |
+
+**Why Colab ran OOM even on A100 (120 GB RAM):**
+- Reading a full mosaic band into memory: 109050 × 22640 × 3 (float64) = ~59 GB for input alone
+- Stacking all 10 bands simultaneously = ~99 GB
+- Plus Python interpreter + geoai/torch libraries = >120 GB total
+
+**Fix — Windowed/chunked I/O:**
+- Read 512 rows at a time instead of full raster
+- Peak RAM per chunk: 512 × 109050 × 10 × 4 bytes ≈ ~2.2 GB
+- Training tile extraction reads 256×256 patches — negligible RAM
+- Model training itself uses only tile-sized batches — GPU VRAM dominant, not system RAM
+
+**HPC RAM usage (observed):** No OOM even during composite build — fast local disk + chunked I/O kept peak at ~2-4 GB system RAM.
 
 ### 7.13 Lessons Learned
 
@@ -470,6 +535,10 @@ Note: Most time is disk I/O to Google Drive, not GPU compute. Drive latency is h
 7. **Atomic cache invalidation**: Gate all intermediate products on a single completion marker — partial cleanup creates inconsistent state that silently reuses stale data
 8. **Chunked I/O for large rasters**: Any raster >10k×10k pixels must use windowed I/O. Full-band reads of study-area mosaics will OOM even on 100 GB machines
 9. **Pre-download unstable APIs**: 3DEP WMS and USFWS REST APIs frequently timeout on Colab; upload pre-downloaded DEM/NWI tiles to Google Drive instead
+10. **HPC over Colab for large-scale raster work**: Google Drive FUSE mount fails silently for files >4 GB even with BIGTIFF=YES; HPC local scratch is the only reliable environment for 99 GB composites
+11. **HPC firewalls block cloud APIs**: Planetary Computer STAC (NAIP), 3DEP WMS, and USFWS REST APIs are blocked by HPC network policies — pre-upload all data before submitting jobs
+12. **Crashes after successful writes are recoverable**: The `NameError: bands` crash happened on the print line after the composite was fully written — re-running skipped the entire 43-minute build. Always check if the output file exists before re-running
+13. **Match EXPERIMENT_DEFAULTS for every new config param**: Any parameter passed via `overrides={}` must exist in `EXPERIMENT_DEFAULTS` — omitting it raises `ValueError: Unknown override keys` even if the underlying function accepts it via `**kwargs`
 
 ---
 
