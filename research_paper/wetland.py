@@ -1348,7 +1348,7 @@ def generate_weak_labels(
         dep_nodata = src.nodata
         # Reproject/resample depression to match NWI raster grid if shapes differ
         if (src.height, src.width) != ref_shape or src.crs != ref_crs:
-            dep_data = np.empty(ref_shape, dtype=np.float64)
+            dep_data = np.empty(ref_shape, dtype=np.float32)
             reproject(
                 source=rasterio.band(src, 1),
                 destination=dep_data,
@@ -1359,7 +1359,7 @@ def generate_weak_labels(
                 resampling=Resampling.bilinear,
             )
         else:
-            dep_data = src.read(1).astype(np.float64)
+            dep_data = src.read(1).astype(np.float32)
 
     # Step 1: Start with NWI labels
     reliable = labels > 0  # mask of pixels with any label
@@ -1379,6 +1379,7 @@ def generate_weak_labels(
     if dep_nodata is not None:
         dep_valid &= dep_data != dep_nodata
     reliable &= dep_valid
+    del dep_data, dep_valid
     n_dep = int(np.sum(reliable))
     print(f"  Weak labels step 2 (depression filter): {n_dep} pixels remain "
           f"({100*n_dep/max(n_nwi,1):.1f}%)", flush=True)
@@ -1387,7 +1388,7 @@ def generate_weak_labels(
     def _read_aligned(path: str) -> np.ndarray:
         with rasterio.open(path) as src:
             if (src.height, src.width) != ref_shape:
-                arr = np.empty(ref_shape, dtype=np.float64)
+                arr = np.empty(ref_shape, dtype=np.float32)
                 reproject(
                     source=rasterio.band(src, 1),
                     destination=arr,
@@ -1396,7 +1397,7 @@ def generate_weak_labels(
                     resampling=Resampling.bilinear,
                 )
                 return arr
-            return src.read(1).astype(np.float64)
+            return src.read(1).astype(np.float32)
 
     # Step 3: Temporal stability filter
     if len(ndvi_paths) >= 2:
@@ -1405,12 +1406,14 @@ def generate_weak_labels(
             ndvi2 = _read_aligned(ndvi_paths[i + 1])
             ndvi_change = np.abs(ndvi2 - ndvi1)
             reliable &= ndvi_change <= stability_threshold
+            del ndvi1, ndvi2, ndvi_change
 
         for i in range(len(ndwi_paths) - 1):
             ndwi1 = _read_aligned(ndwi_paths[i])
             ndwi2 = _read_aligned(ndwi_paths[i + 1])
             ndwi_change = np.abs(ndwi2 - ndwi1)
             reliable &= ndwi_change <= stability_threshold
+            del ndwi1, ndwi2, ndwi_change
 
     n_stable = int(np.sum(reliable))
     print(f"  Weak labels step 3 (stability filter, thresh={stability_threshold}): "
