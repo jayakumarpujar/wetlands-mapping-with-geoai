@@ -362,7 +362,7 @@ def run_composites(
         # Mark that this composite was built from mosaics (not single tiles)
         mosaic_marker.touch()
         print(
-            f"  Created {len(bands)}-band training composite -> {training_composite_path}",
+            f"  Created {num_bands}-band training composite -> {training_composite_path}",
             flush=True,
         )
     elif composite_paths:
