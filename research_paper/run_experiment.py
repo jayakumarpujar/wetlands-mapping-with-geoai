@@ -403,43 +403,57 @@ def run_weak_labels(
     # Use the training composite (10-band) if available, else first per-epoch composite
     composite_for_tiles = training_composite or composite_result["composite_paths"][0]
 
-    # Reclassify NWI to Cowardin classes (use same grid as training composite)
-    # Always regenerate — ensures alignment with current training composite
     nwi_raster_path = str(composites_dir / "nwi_raster.tif")
-    reclassify_nwi(
-        nwi_path=download_result["nwi_path"],
-        raster_template=composite_for_tiles,
-        output_path=nwi_raster_path,
-        overwrite=True,
-    )
-
-    # Generate weak labels with depression + temporal filtering
-    # Always regenerate — thresholds may have changed between runs
     weak_label_path = str(composites_dir / "weak_labels.tif")
-    generate_weak_labels(
-        nwi_raster_path=nwi_raster_path,
-        depression_path=composite_result["depression_path"],
-        ndvi_paths=composite_result["ndvi_paths"],
-        ndwi_paths=composite_result["ndwi_paths"],
-        output_path=weak_label_path,
-        overwrite=True,
-    )
+    tiles_images_dir = Path(tiles_dir) / "images"
 
-    # Export training tiles from the training composite
-    tile_result = export_training_tiles(
-        composite_path=composite_for_tiles,
-        label_path=weak_label_path,
-        output_dir=tiles_dir,
-        tile_size=config["training"]["tile_size"],
-        overwrite=True,
-    )
-    num_tiles = tile_result["num_tiles"]
-
-    if num_tiles == 0:
-        raise RuntimeError(
-            "No training tiles were generated. Check that NWI covers the study area "
-            "and that depression/stability thresholds are not too strict."
+    # Skip entire Phase 2 if tiles already exist
+    if tiles_images_dir.exists() and any(tiles_images_dir.glob("*.tif")):
+        num_tiles = len(list(tiles_images_dir.glob("*.tif")))
+        print(
+            f"  Training tiles already exist ({num_tiles} tiles), skipping Phase 2.",
+            flush=True,
         )
+    else:
+        # Reclassify NWI to Cowardin classes
+        if Path(nwi_raster_path).exists():
+            print("  NWI raster already exists, reusing.", flush=True)
+        else:
+            reclassify_nwi(
+                nwi_path=download_result["nwi_path"],
+                raster_template=composite_for_tiles,
+                output_path=nwi_raster_path,
+                overwrite=False,
+            )
+
+        # Generate weak labels with depression + temporal filtering
+        if Path(weak_label_path).exists():
+            print("  Weak labels already exist, reusing.", flush=True)
+        else:
+            generate_weak_labels(
+                nwi_raster_path=nwi_raster_path,
+                depression_path=composite_result["depression_path"],
+                ndvi_paths=composite_result["ndvi_paths"],
+                ndwi_paths=composite_result["ndwi_paths"],
+                output_path=weak_label_path,
+                overwrite=False,
+            )
+
+        # Export training tiles from the training composite
+        tile_result = export_training_tiles(
+            composite_path=composite_for_tiles,
+            label_path=weak_label_path,
+            output_dir=tiles_dir,
+            tile_size=config["training"]["tile_size"],
+            overwrite=True,
+        )
+        num_tiles = tile_result["num_tiles"]
+
+        if num_tiles == 0:
+            raise RuntimeError(
+                "No training tiles were generated. Check that NWI covers the study area "
+                "and that depression/stability thresholds are not too strict."
+            )
 
     # Auto-detect actual band count from the training composite
     import rasterio as _rio
@@ -448,7 +462,7 @@ def run_weak_labels(
     config["training"]["in_channels"] = actual_channels
 
     print(
-        f"  Exported {num_tiles} training tiles ({actual_channels} bands).",
+        f"  {num_tiles} training tiles ({actual_channels} bands).",
         flush=True,
     )
 
