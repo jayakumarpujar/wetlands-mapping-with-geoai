@@ -1803,7 +1803,7 @@ def train_wetland_model(
         max_class_weight=max_class_weight,
         device=resolved_device,
         verbose=True,
-        save_best_only=True,
+        save_best_only=False,
         **kwargs,
     )
 
