@@ -32,11 +32,13 @@ COWARDIN_CLASSES: Dict[int, str] = {
     0: "Upland",
     1: "Water",
     2: "Emergent",
-    3: "Forested",
-    4: "Scrub-Shrub",
-    5: "Other",
+    3: "Other",
 }
-"""Cowardin-based wetland classification schema (7-class simplified)."""
+"""Cowardin-based wetland classification schema (4-class, PPR-optimized).
+
+Collapsed from 6 classes: Forested and Scrub-Shrub merged into Other
+because PPR (prairie grassland) has zero forested/shrub wetlands.
+"""
 
 NWI_CODE_TO_CLASS: Dict[str, int] = {
     "L": 1,     # Lacustrine -> Water
@@ -45,8 +47,8 @@ NWI_CODE_TO_CLASS: Dict[str, int] = {
     "PUB": 1,   # Palustrine Unconsolidated Bottom -> Water
     "POW": 1,   # Palustrine Open Water -> Water
     "PEM": 2,   # Palustrine Emergent -> Emergent
-    "PFO": 3,   # Palustrine Forested -> Forested
-    "PSS": 4,   # Palustrine Scrub-Shrub -> Scrub-Shrub
+    "PFO": 3,   # Palustrine Forested -> Other (absent in PPR)
+    "PSS": 3,   # Palustrine Scrub-Shrub -> Other (absent in PPR)
 }
 """Mapping from NWI Cowardin code prefixes to target class IDs."""
 
@@ -101,7 +103,7 @@ EXPERIMENT_DEFAULTS: Dict[str, Any] = {
     "batch_size": 8,
     "learning_rate": 1e-3,
     "val_split": 0.2,
-    "num_classes": 6,
+    "num_classes": 4,
     "in_channels": 10,
     "loss_function": "focal",
     "use_class_weights": True,
@@ -206,11 +208,11 @@ def _parse_nwi_code(code: Optional[str]) -> int:
         code: NWI attribute code string (e.g., 'PEM1Ch', 'L1UBHh').
 
     Returns:
-        Integer class ID from COWARDIN_CLASSES. Returns 5 (Other) for
+        Integer class ID from COWARDIN_CLASSES. Returns 3 (Other) for
         unrecognized or empty codes.
     """
     if not code:
-        return 5
+        return 3
 
     upper = code.upper()
 
@@ -224,7 +226,7 @@ def _parse_nwi_code(code: Optional[str]) -> int:
         if prefix3 in NWI_CODE_TO_CLASS:
             return NWI_CODE_TO_CLASS[prefix3]
 
-    return 5
+    return 3
 
 
 def _compute_index(name: str, bands: Dict[str, np.ndarray]) -> np.ndarray:
@@ -1627,7 +1629,7 @@ def train_wetland_model(
     output_dir: Union[str, Path],
     architecture: str = "unetplusplus",
     encoder_name: str = "resnet50",
-    num_classes: int = 6,
+    num_classes: int = 4,
     in_channels: int = 14,
     num_epochs: int = 50,
     batch_size: int = 8,
@@ -1651,7 +1653,7 @@ def train_wetland_model(
     Wraps ``geoai.landcover_train.train_segmentation_landcover`` with
     wetland-specific defaults: U-Net++ architecture, ResNet-50 encoder,
     14-band input (2 NAIP epochs x 6 bands + DEM + depression depth),
-    6 Cowardin classes, focal loss with class weights.
+    4 Cowardin classes (PPR-optimized), focal loss with class weights.
 
     Args:
         tiles_dir: Root directory containing ``images/`` and ``labels/``
@@ -1840,7 +1842,7 @@ def predict_wetlands(
     output_path: Union[str, Path],
     architecture: str = "unetplusplus",
     encoder_name: str = "resnet50",
-    num_classes: int = 6,
+    num_classes: int = 4,
     in_channels: int = 14,
     tile_size: int = 256,
     overlap: int = 128,
@@ -1864,7 +1866,7 @@ def predict_wetlands(
         architecture: Segmentation architecture name. Must match the
             architecture used during training. Default ``"unetplusplus"``.
         encoder_name: Encoder backbone name. Default ``"resnet50"``.
-        num_classes: Number of output classes. Default 6.
+        num_classes: Number of output classes. Default 4.
         in_channels: Number of input bands. Default 14.
         tile_size: Inference tile size in pixels. Default 256.
         overlap: Overlap between adjacent tiles in pixels. Default 128.

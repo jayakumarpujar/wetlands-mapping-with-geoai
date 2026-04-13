@@ -13,7 +13,7 @@ BATCH = 2
 CHANNELS = 32
 HEIGHT = 64
 WIDTH = 64
-NUM_CLASSES = 6
+NUM_CLASSES = 4
 INPUT_CHANNELS = 7
 
 
@@ -344,17 +344,17 @@ class TestMetrics:
     def test_perfect_prediction(self) -> None:
         import numpy as np
         from research_paper.train_benchmark import compute_metrics
-        pred = np.array([0, 1, 2, 3, 4, 5])
-        target = np.array([0, 1, 2, 3, 4, 5])
-        metrics = compute_metrics(pred, target, 6)
+        pred = np.array([0, 1, 2, 3])
+        target = np.array([0, 1, 2, 3])
+        metrics = compute_metrics(pred, target, NUM_CLASSES)
         assert metrics["overall_accuracy"] == 1.0
         assert metrics["mean_iou"] == 1.0
 
     def test_wrong_prediction(self) -> None:
         import numpy as np
         from research_paper.train_benchmark import compute_metrics
-        pred = np.array([1, 0, 3, 2, 5, 4])
-        target = np.array([0, 1, 2, 3, 4, 5])
-        metrics = compute_metrics(pred, target, 6)
+        pred = np.array([1, 0, 3, 2])
+        target = np.array([0, 1, 2, 3])
+        metrics = compute_metrics(pred, target, NUM_CLASSES)
         assert metrics["overall_accuracy"] == 0.0
         assert metrics["mean_iou"] == 0.0

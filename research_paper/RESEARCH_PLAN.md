@@ -24,7 +24,7 @@ We deliberately narrowed from "wetland mapping" (broad, saturated) to **sub-hect
 - Sub-hectare targets (often <0.5 ha, some <0.1 ha) — invisible to Sentinel-2 (10m) or Landsat (30m)
 - Requires 1m resolution (NAIP) — creates massive rasters (109K x 22K pixels) that break standard architectures
 - Seasonal inundation (dry in summer, wet in spring) means single-date classification fails
-- 6-class Cowardin taxonomy (not just binary wet/dry) demands fine-grained spectral + topographic discrimination
+- 4-class Cowardin taxonomy (Upland, Water, Emergent, Other — Forested/Scrub-Shrub absent in PPR, collapsed into Other)
 - No ground truth available at scale — must use weak labels from imperfect NWI
 
 **Strategic advantages for our team:**
@@ -39,7 +39,7 @@ We deliberately narrowed from "wetland mapping" (broad, saturated) to **sub-hect
 |---|---|
 | Global wetland mapping | Too broad, requires multi-sensor fusion across biomes — 3-year project |
 | Sentinel-2 wetland mapping | Saturated space (Igwe 2026, many others). 10m can't see sub-hectare potholes |
-| Binary wet/dry classification | Too simple for a top venue. 6-class Cowardin adds novelty + practical value |
+| Binary wet/dry classification | Too simple for a top venue. 4-class Cowardin adds novelty + practical value |
 | Change detection only | ChangeMamba already exists. We want classification + dynamics |
 | Coastal wetlands | Different geomorphology, no depression prior, not Wu's domain |
 
@@ -294,7 +294,7 @@ Each baseline represents a specific paradigm. Together they tell a complete stor
 
 - Source: NWI rasterized → depression filtered → temporal stability filtered → object confidence filtered
 - ~100K tiles at 256x256 (1m/pixel = 256m x 256m coverage per tile)
-- 6 classes: Upland, Water, Emergent, Forested, Scrub-Shrub, Other
+- 4 classes: Upland (0), Water (1), Emergent (2), Other (3) — Forested/Scrub-Shrub collapsed (0 pixels in PPR)
 - 60:40 train/val split, stratified by ecoregion
 
 **No new data collection needed.** Entire weak label pipeline is built and tested (Phase 2 of existing repo).

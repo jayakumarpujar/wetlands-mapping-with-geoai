@@ -7,7 +7,7 @@ Main architecture combining:
     4. Multi-Temporal SSM fusion — wetland phenology modeling
 
 Input: Multi-epoch NAIP+LiDAR composites (10 bands per epoch × T epochs)
-Output: 6-class Cowardin wetland segmentation map
+Output: 4-class Cowardin wetland segmentation map
 
 Architecture flow:
     For each epoch:
@@ -15,7 +15,7 @@ Architecture flow:
     → TemporalSSMFusion at each scale → fused multi-scale features
     → MambaDecoder with skip connections → decoded features
     → DAG module (with depression depth) → gated features
-    → segmentation head → 6-class prediction
+    → segmentation head → 4-class prediction
 
 References:
     - Jakubik et al. (2024): Prithvi-EO-2.0
@@ -223,7 +223,7 @@ class WetMamba(nn.Module):
         → segmentation head
 
     Args:
-        num_classes: Number of output classes. Defaults to 6 (Cowardin).
+        num_classes: Number of output classes. Defaults to 4 (Cowardin, PPR-optimized).
         input_channels: Bands per epoch. Defaults to 10.
         encoder_name: Prithvi model ID.
         encoder_channels: Feature channels at each encoder scale.
@@ -239,7 +239,7 @@ class WetMamba(nn.Module):
 
     def __init__(
         self,
-        num_classes: int = 6,
+        num_classes: int = 4,
         input_channels: int = 7,
         encoder_name: str = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
         encoder_channels: Optional[List[int]] = None,

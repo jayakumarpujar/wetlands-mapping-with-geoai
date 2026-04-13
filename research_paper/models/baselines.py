@@ -33,7 +33,7 @@ class SMPBaseline(nn.Module):
         arch: Architecture name (e.g., "unetplusplus", "deeplabv3plus").
         encoder_name: Backbone encoder. Defaults to "resnet50".
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 6.
+        num_classes: Output classes. Defaults to 4.
         encoder_weights: Pretrained weights. Defaults to "imagenet".
     """
 
@@ -42,7 +42,7 @@ class SMPBaseline(nn.Module):
         arch: str = "unetplusplus",
         encoder_name: str = "resnet50",
         input_channels: int = 7,
-        num_classes: int = 6,
+        num_classes: int = 4,
         encoder_weights: str = "imagenet",
     ) -> None:
         super().__init__()
@@ -88,14 +88,14 @@ class SegFormerBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 6.
+        num_classes: Output classes. Defaults to 4.
         variant: SegFormer variant (b0-b5). Defaults to "b2".
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 6,
+        num_classes: int = 4,
         variant: str = "b2",
     ) -> None:
         super().__init__()
@@ -189,13 +189,13 @@ class SwinUNetBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 6.
+        num_classes: Output classes. Defaults to 4.
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 6,
+        num_classes: int = 4,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -288,14 +288,14 @@ class UNetMambaBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 6.
+        num_classes: Output classes. Defaults to 4.
         encoder_name: CNN backbone. Defaults to "resnet50".
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 6,
+        num_classes: int = 4,
         encoder_name: str = "resnet50",
     ) -> None:
         super().__init__()
@@ -379,14 +379,14 @@ class PrithviLinearBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 6.
+        num_classes: Output classes. Defaults to 4.
         encoder_name: Prithvi model ID.
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 6,
+        num_classes: int = 4,
         encoder_name: str = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
     ) -> None:
         super().__init__()
@@ -430,7 +430,7 @@ class PrithviLinearBaseline(nn.Module):
 
 def build_model(
     name: str,
-    num_classes: int = 6,
+    num_classes: int = 4,
     input_channels: int = 7,
     **kwargs,
 ) -> nn.Module:

@@ -75,7 +75,7 @@ class TrainConfig:
 
     model_name: str = "wetmamba"
     ablation: Optional[str] = None
-    num_classes: int = 6
+    num_classes: int = 4
     input_channels: int = 7
     tile_size: int = 256
     batch_size: int = 8
