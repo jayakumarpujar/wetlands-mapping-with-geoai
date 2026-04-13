@@ -19,5 +19,13 @@ scipy>=1.11.0
 # Data handling
 pandas>=2.0.0
 
+# Foundation models & Mamba
+transformers>=4.40.0
+peft>=0.10.0
+timm>=1.0.0
+
+# Experiment tracking
+wandb>=0.16.0
+
 # Testing
 pytest>=7.0.0
