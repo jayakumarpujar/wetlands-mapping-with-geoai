@@ -462,7 +462,10 @@ def run_weak_labels(
 def run_training(
     config: Dict[str, Any], label_result: Dict[str, str]
 ) -> List[Dict[str, Any]]:
-    """Phase 3: Train models for each architecture configuration."""
+    """Phase 3: Train models for each architecture configuration.
+
+    Skips training for architectures whose best_model.pth already exists.
+    """
     paths = config["paths"]
     training = config["training"]
     models_dir = Path(paths["models_dir"])
@@ -472,6 +475,23 @@ def run_training(
         arch_name = arch_cfg["architecture"]
         encoder = arch_cfg.get("encoder_name", "resnet50")
         model_dir = str(models_dir / f"{arch_name}_{encoder}")
+
+        # Skip if already trained
+        best_model_path = Path(model_dir) / "best_model.pth"
+        if best_model_path.exists():
+            print(
+                f"  {arch_name} ({encoder}) already trained, skipping. "
+                f"({best_model_path})",
+                flush=True,
+            )
+            trained_models.append(
+                {
+                    "model_path": str(best_model_path),
+                    "output_dir": model_dir,
+                    "display_name": f"{arch_name} ({encoder})",
+                }
+            )
+            continue
 
         print(
             f"  Training {arch_name} ({encoder}) ...",
@@ -528,12 +548,23 @@ def run_inference(
 
     all_predictions = []
     for model_info in trained_models:
-        arch = model_info["architecture"]
-        encoder = model_info["encoder_name"]
+        arch = model_info.get("architecture", model_info.get("display_name", "unknown"))
+        encoder = model_info.get("encoder_name", "resnet50")
 
         pred_path = str(
             predictions_dir / f"pred_{arch}_{encoder}.tif"
         )
+
+        # Skip if prediction already exists
+        if Path(pred_path).exists():
+            print(f"  Prediction for {arch} ({encoder}) already exists, skipping.", flush=True)
+            all_predictions.append(
+                {
+                    "model_info": model_info,
+                    "prediction_paths": [pred_path],
+                }
+            )
+            continue
 
         print(f"  Predicting with {arch} ({encoder}) ...", flush=True)
         predict_wetlands(

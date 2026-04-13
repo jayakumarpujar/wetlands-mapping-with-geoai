@@ -540,6 +540,59 @@ The 10-band training composite creation is the most RAM-intensive step:
 12. **Crashes after successful writes are recoverable**: The `NameError: bands` crash happened on the print line after the composite was fully written — re-running skipped the entire 43-minute build. Always check if the output file exists before re-running
 13. **Match EXPERIMENT_DEFAULTS for every new config param**: Any parameter passed via `overrides={}` must exist in `EXPERIMENT_DEFAULTS` — omitting it raises `ValueError: Unknown override keys` even if the underlying function accepts it via `**kwargs`
 
+### 7.17 HPC Run — Weak Labels + Step 4 Optimization (2026-04-13)
+
+**Environment:** USD HPC Lawrence himem partition (1.5 TB RAM per node, 2 nodes)
+**Script:** `run_ppr_hpc.py` with pre-uploaded data (NAIP, DEM, NWI, composite all cached)
+
+| Phase | Step | Output | Notes |
+|-------|------|--------|-------|
+| 1a-1b | Load + composite | Skipped | All cached from 2026-03-30 run |
+| 2 | Weak labels step 1 (NWI) | 32,404,322 pixels | Full study area labels loaded |
+| 2 | Weak labels step 2 (depression filter) | 29,504,826 pixels (91.1%) | ~3M non-depression pixels removed |
+| 2 | Weak labels step 3 (stability filter, thresh=0.3) | 29,307,900 pixels (90.4%) | ~200K temporally unstable pixels removed |
+| 2 | Weak labels step 4 (component filter) | 30,774,991/32,404,322 retained (95.0%) | Vectorized bincount — completed successfully |
+| 2 | Tile export | Pending | Next step |
+
+**Critical bug fixed — Step 4 component filter was O(n × num_components):**
+
+The original Step 4 code iterated over every connected component individually:
+```python
+for comp_id in range(1, num_comps + 1):      # millions of wetland components
+    comp_mask = comp_labels == comp_id         # 10 GB bool array per iteration
+    total_pixels = np.sum(comp_mask)           # full 2.47B pixel scan
+    reliable_pixels = np.sum(comp_mask & reliable)  # another full scan
+```
+
+On 2.47B pixel raster with millions of small prairie potholes, this creates:
+- **10 GB temporary boolean array per component per iteration**
+- **O(num_comps × num_pixels) = quadrillions of operations**
+- Previous HPC runs likely OOM-killed or hung at this step
+
+**Fix (commit `1b11554`):** Replaced with vectorized `np.bincount`:
+```python
+total_per_comp = np.bincount(flat_comp, minlength=num_comps + 1)
+reliable_per_comp = np.bincount(flat_comp, weights=reliable, minlength=num_comps + 1)
+frac = reliable_per_comp / total_per_comp
+keep_ids = frac >= min_component_fraction
+output_labels[keep_ids[comp_labels]] = cls
+```
+
+| Metric | Before (per-component loop) | After (vectorized bincount) |
+|--------|----------------------------|----------------------------|
+| Time complexity | O(num_comps × num_pixels) | O(num_pixels) |
+| Temp arrays per class | millions × 10 GB | ~20 MB (bincount arrays) |
+| Peak RAM per class | 10 GB (comp_labels) + 10 GB (comp_mask) | 10 GB (comp_labels) + ~20 MB |
+| Step 4 completion | Hung/OOM-killed | Completed successfully |
+
+Step 3 also optimized with in-place `np.subtract`/`np.abs` to avoid allocating a 3rd 10 GB intermediate array (peak: 2 × 10 GB instead of 3 × 10 GB).
+
+### 7.18 Lessons Learned (cont.)
+
+14. **Never loop over connected components on large rasters**: `ndimage.label` + per-component masking is O(n²) in practice. Use `np.bincount` for O(n) per-component statistics — it counts all components in a single pass
+15. **In-place NumPy ops for large arrays**: `np.subtract(a, b, out=a)` avoids allocating a new array — critical when each array is 10 GB
+16. **himem partition for data preprocessing, GPU partition for training**: Data prep on 2.47B pixels needs RAM (1.5 TB himem); model training needs GPU VRAM (V100/A100) — use the right partition for each phase
+
 ---
 
 ## 8. References
