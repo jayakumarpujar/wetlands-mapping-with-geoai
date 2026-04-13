@@ -1385,7 +1385,7 @@ def generate_weak_labels(
           f"({100*n_dep/max(n_nwi,1):.1f}%)", flush=True)
 
     # Helper: read a single-band raster, reprojecting to ref grid if needed
-    def _read_aligned(path: str) -> np.ndarray:
+    def _read_aligned(path: Union[str, Path]) -> np.ndarray:
         with rasterio.open(path) as src:
             if (src.height, src.width) != ref_shape:
                 arr = np.empty(ref_shape, dtype=np.float32)
@@ -1400,43 +1400,71 @@ def generate_weak_labels(
             return src.read(1).astype(np.float32)
 
     # Step 3: Temporal stability filter
+    # Optimized: reuse single buffer, subtract in-place, avoid 3 simultaneous
+    # full-size float32 arrays. Peak RAM: 2 × 10GB instead of 3 × 10GB.
     if len(ndvi_paths) >= 2:
         for i in range(len(ndvi_paths) - 1):
-            ndvi1 = _read_aligned(ndvi_paths[i])
-            ndvi2 = _read_aligned(ndvi_paths[i + 1])
-            ndvi_change = np.abs(ndvi2 - ndvi1)
-            reliable &= ndvi_change <= stability_threshold
-            del ndvi1, ndvi2, ndvi_change
+            arr1 = _read_aligned(ndvi_paths[i])
+            arr2 = _read_aligned(ndvi_paths[i + 1])
+            np.subtract(arr2, arr1, out=arr1)  # reuse arr1 buffer
+            np.abs(arr1, out=arr1)
+            reliable &= arr1 <= stability_threshold
+            del arr1, arr2
 
         for i in range(len(ndwi_paths) - 1):
-            ndwi1 = _read_aligned(ndwi_paths[i])
-            ndwi2 = _read_aligned(ndwi_paths[i + 1])
-            ndwi_change = np.abs(ndwi2 - ndwi1)
-            reliable &= ndwi_change <= stability_threshold
-            del ndwi1, ndwi2, ndwi_change
+            arr1 = _read_aligned(ndwi_paths[i])
+            arr2 = _read_aligned(ndwi_paths[i + 1])
+            np.subtract(arr2, arr1, out=arr1)
+            np.abs(arr1, out=arr1)
+            reliable &= arr1 <= stability_threshold
+            del arr1, arr2
 
     n_stable = int(np.sum(reliable))
     print(f"  Weak labels step 3 (stability filter, thresh={stability_threshold}): "
           f"{n_stable} pixels remain ({100*n_stable/max(n_nwi,1):.1f}%)", flush=True)
 
     # Step 4: Object-level confidence filtering
-    # Label connected components per class
+    # Vectorized with np.bincount — O(n) instead of O(n × num_components).
+    # Old code looped over every component creating a full-size boolean mask
+    # each iteration → catastrophic on 2.47B pixel rasters with millions of
+    # small wetland components.
     output_labels = np.zeros_like(labels)
     unique_classes = [c for c in np.unique(labels) if c > 0]
+    struct = ndimage.generate_binary_structure(2, 1)  # 4-connected
 
     for cls in unique_classes:
         cls_mask = labels == cls
-        # Find connected components for this class
-        struct = ndimage.generate_binary_structure(2, 1)  # 4-connected
         comp_labels, num_comps = ndimage.label(cls_mask, structure=struct)
+        del cls_mask
 
-        for comp_id in range(1, num_comps + 1):
-            comp_mask = comp_labels == comp_id
-            total_pixels = np.sum(comp_mask)
-            reliable_pixels = np.sum(comp_mask & reliable)
+        if num_comps == 0:
+            continue
 
-            if total_pixels > 0 and (reliable_pixels / total_pixels) >= min_component_fraction:
-                output_labels[comp_mask] = cls
+        # Vectorized: count total and reliable pixels per component in O(n)
+        flat_comp = comp_labels.ravel()
+        flat_reliable = reliable.ravel()
+
+        total_per_comp = np.bincount(flat_comp, minlength=num_comps + 1)
+        reliable_per_comp = np.bincount(
+            flat_comp, weights=flat_reliable.astype(np.float32), minlength=num_comps + 1
+        )
+
+        # Fraction of reliable pixels per component (skip background=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            frac = np.where(
+                total_per_comp > 0,
+                reliable_per_comp / total_per_comp,
+                0.0,
+            )
+
+        # Build keep mask: which component IDs pass threshold
+        keep_ids = frac >= min_component_fraction
+        keep_ids[0] = False  # background never kept
+
+        # Map back: vectorized lookup instead of per-component loop
+        output_labels[keep_ids[comp_labels]] = cls
+        del comp_labels, flat_comp, flat_reliable, total_per_comp
+        del reliable_per_comp, frac, keep_ids
 
     # Write output — strip tiling params to avoid BLOCKXSIZE warning
     profile.update(dtype="uint8", count=1, nodata=0, tiled=False)
