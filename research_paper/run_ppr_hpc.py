@@ -162,6 +162,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Copies for oversampled wetland-rich tiles (default: 3).",
     )
 
+    # --- Auto-fallback on training collapse ---
+    fb = p.add_argument_group("auto-fallback on training collapse")
+    fb.add_argument(
+        "--no-auto-fallback", action="store_true",
+        help="Disable auto-retry with harder focal loss when val IoU collapses.",
+    )
+    fb.add_argument(
+        "--collapse-check-epoch", type=int, default=10, metavar="N",
+        help="Epoch after which collapse is evaluated (default: 10).",
+    )
+    fb.add_argument(
+        "--collapse-miou-threshold", type=float, default=0.05, metavar="F",
+        help="Val IoU below this past check epoch triggers fallback (default: 0.05).",
+    )
+    fb.add_argument(
+        "--fallback-loss-function", default="focal", metavar="NAME",
+        choices=[
+            "crossentropy", "focal", "dice", "tversky",
+            "unified_focal", "ce_dice",
+        ],
+        help="Loss to retry with on collapse (default: focal).",
+    )
+    fb.add_argument(
+        "--fallback-focal-gamma", type=float, default=3.0,
+        help="Focal gamma for fallback retry — harder focus (default: 3.0).",
+    )
+    fb.add_argument(
+        "--fallback-max-class-weight", type=float, default=100.0,
+        help="Raised class-weight cap for fallback retry (default: 100).",
+    )
+
     # --- Pre-uploaded data (skip API downloads) ---
     data = p.add_argument_group("pre-uploaded data (skip API downloads)")
     data.add_argument(
@@ -271,6 +302,12 @@ def main() -> None:
         "oversample_wetland_threshold": args.oversample_threshold,
         "oversample_factor": args.oversample_factor,
     }
+    overrides["auto_fallback"] = not args.no_auto_fallback
+    overrides["collapse_check_epoch"] = args.collapse_check_epoch
+    overrides["collapse_miou_threshold"] = args.collapse_miou_threshold
+    overrides["fallback_loss_function"] = args.fallback_loss_function
+    overrides["fallback_focal_gamma"] = args.fallback_focal_gamma
+    overrides["fallback_max_class_weight"] = args.fallback_max_class_weight
     if args.dem_tiles:
         overrides["pre_downloaded_dem_tiles"] = args.dem_tiles
     if args.nwi_path:

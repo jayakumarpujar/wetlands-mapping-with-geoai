@@ -545,6 +545,14 @@ def run_training(
             ufl_gamma=training.get("ufl_gamma", 0.75),
             ufl_delta=training.get("ufl_delta", 0.6),
             max_class_weight=training.get("max_class_weight", 50.0),
+            auto_fallback=training.get("auto_fallback", True),
+            collapse_check_epoch=training.get("collapse_check_epoch", 10),
+            collapse_miou_threshold=training.get("collapse_miou_threshold", 0.05),
+            fallback_loss_function=training.get("fallback_loss_function", "focal"),
+            fallback_focal_gamma=training.get("fallback_focal_gamma", 3.0),
+            fallback_max_class_weight=training.get(
+                "fallback_max_class_weight", 100.0
+            ),
             val_split=training["val_split"],
             seed=training["seed"],
             num_workers=training.get("num_workers", 4),

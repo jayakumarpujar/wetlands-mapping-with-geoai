@@ -1700,6 +1700,13 @@ def export_training_tiles(
 # ---------------------------------------------------------------------------
 
 
+# Signals auto-fallback when training collapses to majority class.
+# Inherits BaseException (not Exception) so geoai's callback-level
+# ``except Exception`` does not swallow it.
+class _TrainingCollapsed(BaseException):
+    """Raised when val IoU stays near zero past a threshold epoch."""
+
+
 def train_wetland_model(
     tiles_dir: Union[str, Path],
     output_dir: Union[str, Path],
@@ -1723,6 +1730,12 @@ def train_wetland_model(
     ufl_gamma: float = 0.75,
     ufl_delta: float = 0.6,
     max_class_weight: float = 50.0,
+    auto_fallback: bool = True,
+    collapse_check_epoch: int = 10,
+    collapse_miou_threshold: float = 0.05,
+    fallback_loss_function: str = "focal",
+    fallback_focal_gamma: float = 3.0,
+    fallback_max_class_weight: float = 100.0,
     device: Optional[str] = None,
     overwrite: bool = False,
     **kwargs: Any,
@@ -1771,6 +1784,18 @@ def train_wetland_model(
         ufl_delta: Unified Focal Loss Tversky false-negative weight.
             Default 0.6.
         max_class_weight: Maximum class weight cap. Default 50.0.
+        auto_fallback: If True, automatically retries training with a
+            harder-focused focal loss when the primary run collapses
+            to trivial majority-class predictions. Default True.
+        collapse_check_epoch: Earliest epoch at which collapse may be
+            declared. Default 10.
+        collapse_miou_threshold: Val mIoU below this value at or after
+            ``collapse_check_epoch`` triggers the fallback. Default 0.05.
+        fallback_loss_function: Loss to use on the retry. Default
+            ``"focal"`` (harder focus via larger gamma).
+        fallback_focal_gamma: Focal gamma on the retry. Default 3.0.
+        fallback_max_class_weight: Max class weight cap on the retry.
+            Default 100.0 — lets rare wetland classes dominate gradient.
         device: Device string (e.g. ``"cuda"``, ``"cpu"``). Auto-detected
             if None.
         overwrite: Allow overwriting existing output_dir. Default False.
@@ -1882,36 +1907,96 @@ def train_wetland_model(
         resolved_device,
     )
 
-    # --- Train via geoai ---
-    model = train_segmentation_landcover(
-        images_dir=str(images_dir),
-        labels_dir=str(labels_dir),
-        output_dir=str(output_dir),
-        architecture=architecture,
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        num_channels=in_channels,
-        num_classes=num_classes,
-        batch_size=batch_size,
-        num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        seed=seed,
-        val_split=val_split,
-        loss_function=loss_function,
-        use_class_weights=use_class_weights,
-        ignore_index=ignore_index,
-        focal_alpha=focal_alpha,
-        focal_gamma=focal_gamma,
-        ufl_lambda=ufl_lambda,
-        ufl_gamma=ufl_gamma,
-        ufl_delta=ufl_delta,
-        max_class_weight=max_class_weight,
-        device=resolved_device,
-        verbose=True,
-        save_best_only=False,
-        **kwargs,
-    )
+    # Collapse detector: raises _TrainingCollapsed when val IoU stays
+    # below `collapse_miou_threshold` through `collapse_check_epoch`.
+    # Disabled automatically on fallback attempts to avoid infinite loops.
+    def _make_collapse_guard(enabled: bool):
+        def _callback(
+            epoch: int,
+            train_loss: float,
+            val_loss: float,
+            val_iou: float,
+            val_dice: float,
+            is_best: bool,
+        ) -> None:
+            if not enabled:
+                return
+            if epoch + 1 >= collapse_check_epoch and val_iou < collapse_miou_threshold:
+                print(
+                    f"  [collapse-guard] epoch {epoch + 1}: "
+                    f"val_iou={val_iou:.4f} < {collapse_miou_threshold}, "
+                    "aborting to retry with harder focus.",
+                    flush=True,
+                )
+                raise _TrainingCollapsed(
+                    f"val_iou={val_iou:.4f} at epoch {epoch + 1}"
+                )
+
+        return _callback
+
+    def _run_training(
+        active_loss: str,
+        active_focal_gamma: float,
+        active_max_class_weight: float,
+        guard_enabled: bool,
+    ):
+        return train_segmentation_landcover(
+            images_dir=str(images_dir),
+            labels_dir=str(labels_dir),
+            output_dir=str(output_dir),
+            architecture=architecture,
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            num_channels=in_channels,
+            num_classes=num_classes,
+            batch_size=batch_size,
+            num_epochs=num_epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            seed=seed,
+            val_split=val_split,
+            loss_function=active_loss,
+            use_class_weights=use_class_weights,
+            ignore_index=ignore_index,
+            focal_alpha=focal_alpha,
+            focal_gamma=active_focal_gamma,
+            ufl_lambda=ufl_lambda,
+            ufl_gamma=ufl_gamma,
+            ufl_delta=ufl_delta,
+            max_class_weight=active_max_class_weight,
+            device=resolved_device,
+            verbose=True,
+            save_best_only=False,
+            training_callback=_make_collapse_guard(guard_enabled),
+            **kwargs,
+        )
+
+    # --- Train via geoai (with optional auto-fallback on collapse) ---
+    try:
+        model = _run_training(
+            active_loss=loss_function,
+            active_focal_gamma=focal_gamma,
+            active_max_class_weight=max_class_weight,
+            guard_enabled=auto_fallback,
+        )
+    except _TrainingCollapsed as exc:
+        print(
+            f"  [auto-fallback] primary run collapsed ({exc}). "
+            f"Retrying with loss={fallback_loss_function}, "
+            f"focal_gamma={fallback_focal_gamma}, "
+            f"max_class_weight={fallback_max_class_weight}.",
+            flush=True,
+        )
+        logger.warning(
+            "Auto-fallback triggered: %s. Retrying with harder focus.",
+            exc,
+        )
+        model = _run_training(
+            active_loss=fallback_loss_function,
+            active_focal_gamma=fallback_focal_gamma,
+            active_max_class_weight=fallback_max_class_weight,
+            guard_enabled=False,  # no second fallback
+        )
 
     # Locate best model file
     best_model_path = output_dir / "best_model.pth"
