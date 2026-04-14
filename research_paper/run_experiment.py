@@ -337,6 +337,38 @@ def run_composites(
         )
         chunk_height = max(1, min(512, ref_h))
 
+        # Per-band normalization rules — keep all bands in [0,1] so geoai's
+        # `image / 255 if max > 1` shortcut leaves the data alone instead of
+        # crushing indices ([-1,1]) and depression depth (0-5m) to ~0.
+        # Compute DEM elevation min/max once over valid pixels (skip the
+        # -999999 nodata sentinel) for a stable, reproducible scaling.
+        with rasterio.open(dem_path) as _ds:
+            _dem_arr = _ds.read(1)
+            _dem_nodata = _ds.nodata if _ds.nodata is not None else -999999.0
+            _dem_valid = _dem_arr[(_dem_arr != _dem_nodata) & np.isfinite(_dem_arr)]
+            if _dem_valid.size:
+                dem_min = float(_dem_valid.min())
+                dem_max = float(_dem_valid.max())
+            else:
+                dem_min, dem_max = 0.0, 1.0
+            dem_range = max(dem_max - dem_min, 1e-6)
+        print(
+            f"  DEM normalization: min={dem_min:.2f}m max={dem_max:.2f}m range={dem_range:.2f}m",
+            flush=True,
+        )
+
+        # NAIP: bands 1-4. Indices: 5-8. DEM: 9. Depression: 10.
+        def _normalize(out_band: int, arr: np.ndarray) -> np.ndarray:
+            arr = np.where(np.isfinite(arr), arr, 0.0)
+            if out_band <= 4:                 # NAIP RGBNIR (0-255)
+                return np.clip(arr / 255.0, 0.0, 1.0)
+            if out_band <= 8:                 # NDVI / NDWI (-1..1)
+                return np.clip((arr + 1.0) / 2.0, 0.0, 1.0)
+            if out_band == 9:                 # DEM elevation
+                arr = np.where(arr == _dem_nodata, dem_min, arr)
+                return np.clip((arr - dem_min) / dem_range, 0.0, 1.0)
+            return np.clip(arr / 5.0, 0.0, 1.0)  # Depression depth (0-5 m)
+
         with rasterio.open(training_composite_path, "w", **ref_profile) as dst:
             for row_off in range(0, ref_h, chunk_height):
                 h = min(chunk_height, ref_h - row_off)
@@ -357,6 +389,7 @@ def run_composites(
                             )
                         else:
                             arr = src.read(bi, window=win).astype(np.float32)
+                    arr = _normalize(out_band, arr)
                     dst.write(arr, out_band, window=win)
 
         # Mark that this composite was built from mosaics (not single tiles)
