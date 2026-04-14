@@ -69,7 +69,7 @@ class TestTrainWetlandModelSignature(unittest.TestCase):
         from research_paper.wetland import train_wetland_model
 
         sig = inspect.signature(train_wetland_model)
-        self.assertEqual(sig.parameters["num_classes"].default, 6)
+        self.assertEqual(sig.parameters["num_classes"].default, 4)
 
     def test_default_in_channels(self):
         from research_paper.wetland import train_wetland_model
@@ -81,7 +81,7 @@ class TestTrainWetlandModelSignature(unittest.TestCase):
         from research_paper.wetland import train_wetland_model
 
         sig = inspect.signature(train_wetland_model)
-        self.assertEqual(sig.parameters["loss_function"].default, "focal")
+        self.assertEqual(sig.parameters["loss_function"].default, "unified_focal")
 
     def test_default_use_class_weights(self):
         from research_paper.wetland import train_wetland_model

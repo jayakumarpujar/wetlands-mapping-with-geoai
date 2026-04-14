@@ -240,8 +240,8 @@ class TestGenerateWeakLabelsSignature(unittest.TestCase):
 
         sig = inspect.signature(generate_weak_labels)
         self.assertAlmostEqual(sig.parameters["depression_threshold"].default, 0.0)
-        self.assertAlmostEqual(sig.parameters["stability_threshold"].default, 0.05)
-        self.assertAlmostEqual(sig.parameters["min_component_fraction"].default, 0.5)
+        self.assertAlmostEqual(sig.parameters["stability_threshold"].default, 0.3)
+        self.assertAlmostEqual(sig.parameters["min_component_fraction"].default, 0.25)
         self.assertFalse(sig.parameters["overwrite"].default)
 
 

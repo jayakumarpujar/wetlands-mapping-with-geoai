@@ -68,20 +68,24 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- Training hyperparameters ---
     train = p.add_argument_group("training hyperparameters")
     train.add_argument(
-        "--num-epochs", type=int, default=50, metavar="N",
-        help="Number of training epochs (default: 50).",
+        "--num-epochs", type=int, default=100, metavar="N",
+        help="Number of training epochs (default: 100).",
     )
     train.add_argument(
-        "--batch-size", type=int, default=8, metavar="N",
-        help="Training batch size (default: 8).",
+        "--batch-size", type=int, default=32, metavar="N",
+        help="Training batch size (default: 32, V100-32GB FP32 headroom).",
     )
     train.add_argument(
-        "--learning-rate", type=float, default=1e-3, metavar="LR",
-        help="Initial learning rate (default: 1e-3).",
+        "--learning-rate", type=float, default=3e-4, metavar="LR",
+        help="Initial learning rate (default: 3e-4; 1e-3 collapses on PPR).",
     )
     train.add_argument(
-        "--num-workers", type=int, default=4, metavar="N",
-        help="DataLoader worker processes — set to CPU count (default: 4).",
+        "--weight-decay", type=float, default=1e-4, metavar="WD",
+        help="Optimizer weight decay (default: 1e-4).",
+    )
+    train.add_argument(
+        "--num-workers", type=int, default=8, metavar="N",
+        help="DataLoader worker processes — set to CPU count (default: 8).",
     )
     train.add_argument(
         "--tile-size", type=int, default=256, metavar="PX",
@@ -90,6 +94,72 @@ def _build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--val-split", type=float, default=0.2, metavar="F",
         help="Validation fraction 0-1 (default: 0.2).",
+    )
+
+    # --- Class-imbalance mitigation ---
+    imb = p.add_argument_group("class imbalance mitigation")
+    imb.add_argument(
+        "--loss-function", default="unified_focal", metavar="NAME",
+        choices=[
+            "crossentropy", "focal", "dice", "tversky",
+            "unified_focal", "ce_dice",
+        ],
+        help=(
+            "Loss function. unified_focal (default) blends focal CE + "
+            "focal Tversky; ce_dice is a plain CE+Dice alias. Both handle "
+            "severe imbalance (~95%% upland in PPR) better than pure CE."
+        ),
+    )
+    imb.add_argument(
+        "--no-class-weights", action="store_true",
+        help="Disable inverse-frequency class weights (not recommended).",
+    )
+    imb.add_argument(
+        "--ignore-index", type=int, default=-100, metavar="I",
+        help=(
+            "Class index to exclude from loss (default: -100, ignore none). "
+            "Previous default 0 excluded upland and caused gradient "
+            "starvation + collapse to trivial predictions."
+        ),
+    )
+    imb.add_argument(
+        "--max-class-weight", type=float, default=50.0, metavar="W",
+        help="Cap on per-class weight after inverse-frequency (default: 50).",
+    )
+    imb.add_argument(
+        "--focal-gamma", type=float, default=2.0,
+        help="Focal loss focusing parameter (default: 2.0).",
+    )
+    imb.add_argument(
+        "--ufl-lambda", type=float, default=0.5,
+        help="UnifiedFocalLoss lambda [0=Tversky, 1=CE] (default: 0.5).",
+    )
+    imb.add_argument(
+        "--ufl-gamma", type=float, default=0.75,
+        help="UnifiedFocalLoss focusing parameter (default: 0.75).",
+    )
+    imb.add_argument(
+        "--ufl-delta", type=float, default=0.6,
+        help="UnifiedFocalLoss Tversky FN weight (default: 0.6).",
+    )
+    imb.add_argument(
+        "--min-wetland-fraction", type=float, default=0.05, metavar="F",
+        help=(
+            "Drop tiles with less than this fraction of wetland pixels "
+            "(default: 0.05). PPR is ~95%% upland — raise this to "
+            "concentrate training on informative tiles."
+        ),
+    )
+    imb.add_argument(
+        "--oversample-threshold", type=float, default=0.20, metavar="F",
+        help=(
+            "Duplicate tiles with wetland fraction >= this value. "
+            "Default 0.20. Set to 1.01 to disable."
+        ),
+    )
+    imb.add_argument(
+        "--oversample-factor", type=int, default=3, metavar="N",
+        help="Copies for oversampled wetland-rich tiles (default: 3).",
     )
 
     # --- Pre-uploaded data (skip API downloads) ---
@@ -156,13 +226,20 @@ def main() -> None:
     _setup_logging(output_root, args.log_file, args.verbose)
     log = logging.getLogger(__name__)
 
-    log.info("Output root : %s", output_root)
-    log.info("Epochs      : %d", args.num_epochs)
-    log.info("Batch size  : %d", args.batch_size)
-    log.info("LR          : %g", args.learning_rate)
-    log.info("Workers     : %d", args.num_workers)
-    log.info("Tile size   : %d px", args.tile_size)
-    log.info("Val split   : %.0f%%", args.val_split * 100)
+    log.info("Output root   : %s", output_root)
+    log.info("Epochs        : %d", args.num_epochs)
+    log.info("Batch size    : %d", args.batch_size)
+    log.info("LR            : %g", args.learning_rate)
+    log.info("Weight decay  : %g", args.weight_decay)
+    log.info("Workers       : %d", args.num_workers)
+    log.info("Tile size     : %d px", args.tile_size)
+    log.info("Val split     : %.0f%%", args.val_split * 100)
+    log.info("Loss          : %s", args.loss_function)
+    log.info("Class weights : %s", not args.no_class_weights)
+    log.info("Ignore index  : %d", args.ignore_index)
+    log.info("Min wetland frac   : %.3f", args.min_wetland_fraction)
+    log.info("Oversample thresh  : %.3f (x%d)",
+             args.oversample_threshold, args.oversample_factor)
 
     # Import here so import errors are shown clearly
     try:
@@ -178,9 +255,21 @@ def main() -> None:
         "num_epochs": args.num_epochs,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
         "num_workers": args.num_workers,
         "tile_size": args.tile_size,
         "val_split": args.val_split,
+        "loss_function": args.loss_function,
+        "use_class_weights": not args.no_class_weights,
+        "ignore_index": args.ignore_index,
+        "max_class_weight": args.max_class_weight,
+        "focal_gamma": args.focal_gamma,
+        "ufl_lambda": args.ufl_lambda,
+        "ufl_gamma": args.ufl_gamma,
+        "ufl_delta": args.ufl_delta,
+        "min_wetland_fraction": args.min_wetland_fraction,
+        "oversample_wetland_threshold": args.oversample_threshold,
+        "oversample_factor": args.oversample_factor,
     }
     if args.dem_tiles:
         overrides["pre_downloaded_dem_tiles"] = args.dem_tiles

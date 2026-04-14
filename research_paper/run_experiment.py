@@ -445,9 +445,22 @@ def run_weak_labels(
             label_path=weak_label_path,
             output_dir=tiles_dir,
             tile_size=config["training"]["tile_size"],
+            min_wetland_fraction=config["training"].get(
+                "min_wetland_fraction", 0.05
+            ),
+            oversample_wetland_threshold=config["training"].get(
+                "oversample_wetland_threshold", 0.20
+            ),
+            oversample_factor=config["training"].get("oversample_factor", 3),
             overwrite=True,
         )
         num_tiles = tile_result["num_tiles"]
+        print(
+            f"  Tiles: {num_tiles} total "
+            f"({tile_result.get('num_unique_tiles', num_tiles)} unique, "
+            f"{tile_result.get('num_oversampled', 0)} oversampled).",
+            flush=True,
+        )
 
         if num_tiles == 0:
             raise RuntimeError(
@@ -522,8 +535,16 @@ def run_training(
             num_epochs=training["num_epochs"],
             batch_size=training["batch_size"],
             learning_rate=training["learning_rate"],
+            weight_decay=training.get("weight_decay", 1e-4),
             loss_function=training["loss_function"],
             use_class_weights=training["use_class_weights"],
+            ignore_index=training.get("ignore_index", -100),
+            focal_alpha=training.get("focal_alpha", 1.0),
+            focal_gamma=training.get("focal_gamma", 2.0),
+            ufl_lambda=training.get("ufl_lambda", 0.5),
+            ufl_gamma=training.get("ufl_gamma", 0.75),
+            ufl_delta=training.get("ufl_delta", 0.6),
+            max_class_weight=training.get("max_class_weight", 50.0),
             val_split=training["val_split"],
             seed=training["seed"],
             num_workers=training.get("num_workers", 4),

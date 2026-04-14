@@ -99,24 +99,48 @@ PPR_STUDY_AREA: Dict[str, Any] = {
 
 EXPERIMENT_DEFAULTS: Dict[str, Any] = {
     "tile_size": 256,
-    "num_epochs": 50,
-    "batch_size": 8,
-    "learning_rate": 1e-3,
+    "num_epochs": 100,
+    "batch_size": 32,
+    "learning_rate": 3e-4,
+    "weight_decay": 1e-4,
     "val_split": 0.2,
     "num_classes": 4,
     "in_channels": 10,
-    "loss_function": "focal",
+    "loss_function": "unified_focal",
     "use_class_weights": True,
+    "ignore_index": -100,
+    "focal_alpha": 1.0,
+    "focal_gamma": 2.0,
+    "ufl_lambda": 0.5,
+    "ufl_gamma": 0.75,
+    "ufl_delta": 0.6,
+    "max_class_weight": 50.0,
+    "min_wetland_fraction": 0.05,
+    "oversample_wetland_threshold": 0.20,
+    "oversample_factor": 3,
     "seed": 42,
     "dem_resolution": 1,
     "depression_min_depth": 0.1,
-    "num_workers": 4,
+    "num_workers": 8,
     "architectures": [
         {"architecture": "unetplusplus", "encoder_name": "resnet50"},
         {"architecture": "deeplabv3plus", "encoder_name": "resnet50"},
     ],
 }
-"""Default experiment hyperparameters for the wetland mapping paper."""
+"""Default experiment hyperparameters for the wetland mapping paper.
+
+Tuned for severe class imbalance (PPR ~95% upland) on V100-32GB:
+- ``unified_focal`` loss (lambda=0.5 blends focal CE + focal Tversky,
+  functionally equivalent to CE+Dice combo) handles imbalance better
+  than pure focal or pure CE.
+- ``ignore_index=-100`` (not 0) — upland is INCLUDED in loss with a
+  small class weight; excluding it starved the gradient signal and
+  caused collapse to trivial majority-class predictions.
+- ``min_wetland_fraction=0.05`` drops tiles with <5% wetland content.
+- ``oversample_wetland_threshold/factor`` duplicates wetland-rich tiles
+  at export time (poor-man's WeightedRandomSampler that works through
+  the geoai trainer which doesn't expose a sampler hook).
+"""
 
 __all__ = [
     "COWARDIN_CLASSES",
@@ -1498,7 +1522,10 @@ def export_training_tiles(
     output_dir: Union[str, Path],
     tile_size: int = 256,
     stride: Optional[int] = None,
-    min_valid_fraction: float = 0.01,
+    min_valid_fraction: float = 0.05,
+    min_wetland_fraction: Optional[float] = None,
+    oversample_wetland_threshold: float = 0.20,
+    oversample_factor: int = 3,
     overwrite: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -1506,25 +1533,43 @@ def export_training_tiles(
 
     Extracts fixed-size tiles from a composite raster and corresponding
     label raster using a sliding window approach. Tiles with insufficient
-    labeled pixels are filtered out.
+    wetland content are dropped, and wetland-rich tiles are duplicated to
+    mitigate class imbalance (equivalent to WeightedRandomSampler, but
+    compatible with any trainer — geoai's trainer does not expose a
+    DataLoader sampler hook).
 
     Args:
         composite_path: Path to the multi-band composite GeoTIFF.
-        label_path: Path to the single-band label GeoTIFF.
-        output_dir: Root output directory. Creates ``images/`` and ``labels/``
-            subdirectories.
+        label_path: Path to the single-band label GeoTIFF. Class ``0`` is
+            treated as upland (background); any non-zero class is wetland.
+        output_dir: Root output directory. Creates ``images/`` and
+            ``labels/`` subdirectories.
         tile_size: Tile height and width in pixels (default 256).
         stride: Step size between tiles. Defaults to tile_size (no overlap).
-        min_valid_fraction: Minimum fraction of non-zero label pixels
-            required to keep a tile (default 0.5). Set to 0.0 to keep all.
+        min_valid_fraction: Deprecated alias for ``min_wetland_fraction``.
+            Kept for backward compatibility.
+        min_wetland_fraction: Minimum fraction of wetland pixels (non-zero
+            labels) required to keep a tile. PPR is ~95% upland so a
+            minimum of 5% wetland content prevents training on pure-upland
+            tiles that offer no learning signal. Default 0.05.
+        oversample_wetland_threshold: Tiles with wetland fraction >= this
+            value are duplicated ``oversample_factor`` times. Default
+            ``0.20``. Set to ``1.01`` to disable oversampling.
+        oversample_factor: Number of copies to write for tiles above the
+            oversampling threshold. Default ``3``. Must be >= 1.
         overwrite: If True, overwrite existing output directory.
 
     Returns:
-        Dict with keys ``num_tiles``, ``output_dir``, ``tile_size``.
+        Dict with keys:
+            - ``num_tiles``: Total tiles written (including duplicates).
+            - ``num_unique_tiles``: Distinct source windows kept.
+            - ``num_oversampled``: Source windows duplicated.
+            - ``output_dir``: Output directory.
+            - ``tile_size``: Tile size used.
 
     Raises:
         FileNotFoundError: If composite_path or label_path does not exist.
-        ValueError: If tile_size <= 0 or min_valid_fraction not in [0, 1].
+        ValueError: If tile_size <= 0 or fractions are out of range.
         FileExistsError: If output_dir exists and overwrite is False.
     """
     import rasterio
@@ -1534,15 +1579,27 @@ def export_training_tiles(
     label_path = Path(label_path)
     output_dir = Path(output_dir)
 
+    if min_wetland_fraction is None:
+        min_wetland_fraction = min_valid_fraction
+
     if not composite_path.exists():
         raise FileNotFoundError(f"Composite file not found: {composite_path}")
     if not label_path.exists():
         raise FileNotFoundError(f"Label file not found: {label_path}")
     if tile_size <= 0:
         raise ValueError(f"tile_size must be > 0, got {tile_size}")
-    if not (0 <= min_valid_fraction <= 1):
+    if not (0 <= min_wetland_fraction <= 1):
         raise ValueError(
-            f"min_valid_fraction must be in [0, 1], got {min_valid_fraction}"
+            f"min_wetland_fraction must be in [0, 1], got {min_wetland_fraction}"
+        )
+    if not (0 <= oversample_wetland_threshold <= 2):
+        raise ValueError(
+            "oversample_wetland_threshold must be in [0, 2], "
+            f"got {oversample_wetland_threshold}"
+        )
+    if oversample_factor < 1:
+        raise ValueError(
+            f"oversample_factor must be >= 1, got {oversample_factor}"
         )
 
     if stride is None:
@@ -1554,6 +1611,8 @@ def export_training_tiles(
     lbl_dir.mkdir(parents=True, exist_ok=True)
 
     tile_count = 0
+    unique_count = 0
+    oversampled_count = 0
 
     with rasterio.open(composite_path) as comp_src, rasterio.open(label_path) as lbl_src:
         if comp_src.height != lbl_src.height or comp_src.width != lbl_src.width:
@@ -1571,42 +1630,57 @@ def export_training_tiles(
 
                 lbl_tile = lbl_src.read(1, window=window)
 
-                # Filter by valid fraction
-                valid_frac = np.count_nonzero(lbl_tile) / lbl_tile.size
-                if valid_frac < min_valid_fraction:
+                # Wetland-fraction filter (class 0 = upland)
+                wetland_frac = np.count_nonzero(lbl_tile) / lbl_tile.size
+                if wetland_frac < min_wetland_fraction:
                     continue
 
                 comp_tile = comp_src.read(window=window)
 
-                # Compute tile transform
                 tile_transform = rasterio.windows.transform(window, comp_src.transform)
 
-                # Write image tile
                 img_profile = comp_src.profile.copy()
                 img_profile.update(
                     height=tile_size,
                     width=tile_size,
                     transform=tile_transform,
                 )
-                tile_name = f"tile_{row_off:06d}_{col_off:06d}.tif"
-                with rasterio.open(img_dir / tile_name, "w", **img_profile) as dst:
-                    dst.write(comp_tile)
-
-                # Write label tile
                 lbl_profile = lbl_src.profile.copy()
                 lbl_profile.update(
                     height=tile_size,
                     width=tile_size,
                     transform=tile_transform,
                 )
-                with rasterio.open(lbl_dir / tile_name, "w", **lbl_profile) as dst:
-                    dst.write(lbl_tile, 1)
 
-                tile_count += 1
+                # Oversample wetland-rich tiles (class-imbalance mitigation)
+                n_copies = (
+                    oversample_factor
+                    if wetland_frac >= oversample_wetland_threshold
+                    else 1
+                )
+                if n_copies > 1:
+                    oversampled_count += 1
+
+                for copy_idx in range(n_copies):
+                    if copy_idx == 0:
+                        tile_name = f"tile_{row_off:06d}_{col_off:06d}.tif"
+                    else:
+                        tile_name = (
+                            f"tile_{row_off:06d}_{col_off:06d}_dup{copy_idx}.tif"
+                        )
+                    with rasterio.open(img_dir / tile_name, "w", **img_profile) as dst:
+                        dst.write(comp_tile)
+                    with rasterio.open(lbl_dir / tile_name, "w", **lbl_profile) as dst:
+                        dst.write(lbl_tile, 1)
+                    tile_count += 1
+
+                unique_count += 1
 
     logger.info(
-        "Exported %d tiles (%dx%d, stride=%d) -> %s",
+        "Exported %d tiles (%d unique, %d oversampled, %dx%d, stride=%d) -> %s",
         tile_count,
+        unique_count,
+        oversampled_count,
         tile_size,
         tile_size,
         stride,
@@ -1614,6 +1688,8 @@ def export_training_tiles(
     )
     return {
         "num_tiles": tile_count,
+        "num_unique_tiles": unique_count,
+        "num_oversampled": oversampled_count,
         "output_dir": str(output_dir),
         "tile_size": tile_size,
     }
@@ -1631,18 +1707,21 @@ def train_wetland_model(
     encoder_name: str = "resnet50",
     num_classes: int = 4,
     in_channels: int = 14,
-    num_epochs: int = 50,
-    batch_size: int = 8,
-    learning_rate: float = 1e-3,
+    num_epochs: int = 100,
+    batch_size: int = 32,
+    learning_rate: float = 3e-4,
     weight_decay: float = 1e-4,
-    loss_function: str = "focal",
+    loss_function: str = "unified_focal",
     use_class_weights: bool = True,
     val_split: float = 0.2,
     seed: int = 42,
     encoder_weights: Optional[str] = "imagenet",
-    ignore_index: int = 0,
+    ignore_index: int = -100,
     focal_alpha: float = 1.0,
     focal_gamma: float = 2.0,
+    ufl_lambda: float = 0.5,
+    ufl_gamma: float = 0.75,
+    ufl_delta: float = 0.6,
     max_class_weight: float = 50.0,
     device: Optional[str] = None,
     overwrite: bool = False,
@@ -1664,22 +1743,33 @@ def train_wetland_model(
         encoder_name: Backbone encoder name (timm/SMP compatible).
             Default ``"resnet50"``.
         num_classes: Number of output classes including background.
-            Default 6 (Cowardin schema).
+            Default 4 (PPR-collapsed Cowardin schema).
         in_channels: Number of input bands. Default 14.
-        num_epochs: Maximum training epochs. Default 50.
-        batch_size: Training batch size. Default 8.
-        learning_rate: Initial learning rate. Default 1e-3.
+        num_epochs: Maximum training epochs. Default 100.
+        batch_size: Training batch size. Default 32 (V100-32GB FP32).
+        learning_rate: Initial learning rate. Default 3e-4 (AdamW norm
+            for segmentation; 1e-3 collapses on PPR imbalance).
         weight_decay: Weight decay for optimizer. Default 1e-4.
-        loss_function: Loss function name: ``"focal"`` or
-            ``"crossentropy"``. Default ``"focal"``.
+        loss_function: Loss function name. One of ``"crossentropy"``,
+            ``"focal"``, ``"dice"``, ``"tversky"``, ``"unified_focal"``,
+            ``"ce_dice"`` (alias for ``unified_focal`` with CE+Dice
+            equivalent params). Default ``"unified_focal"``.
         use_class_weights: Compute and apply inverse-frequency class
-            weights. Default True.
+            weights. Default True — critical on 95%-upland PPR tiles.
         val_split: Fraction of data for validation. Default 0.2.
         seed: Random seed for reproducibility. Default 42.
         encoder_weights: Pretrained encoder weights. Default ``"imagenet"``.
-        ignore_index: Class index to ignore in loss. Default 0 (Upland).
+        ignore_index: Class index to ignore in loss. Default ``-100``
+            (ignore none). Previously ``0`` (Upland), which starved the
+            gradient signal and caused collapse to trivial majority-class
+            predictions on PPR data.
         focal_alpha: Focal loss alpha parameter. Default 1.0.
         focal_gamma: Focal loss gamma parameter. Default 2.0.
+        ufl_lambda: Unified Focal Loss lambda (0=pure focal Tversky,
+            1=pure focal CE, 0.5=balanced CE+Dice-like). Default 0.5.
+        ufl_gamma: Unified Focal Loss focusing parameter. Default 0.75.
+        ufl_delta: Unified Focal Loss Tversky false-negative weight.
+            Default 0.6.
         max_class_weight: Maximum class weight cap. Default 50.0.
         device: Device string (e.g. ``"cuda"``, ``"cpu"``). Auto-detected
             if None.
@@ -1731,12 +1821,23 @@ def train_wetland_model(
             f"Unsupported architecture: {architecture!r}. "
             f"Choose from: {sorted(SUPPORTED_ARCHITECTURES)}"
         )
-    _supported_losses = frozenset({"focal", "crossentropy"})
+    _supported_losses = frozenset(
+        {"focal", "crossentropy", "dice", "tversky", "unified_focal", "ce_dice"}
+    )
     if loss_function not in _supported_losses:
         raise ValueError(
             f"Unsupported loss_function: {loss_function!r}. "
             f"Choose from: {sorted(_supported_losses)}"
         )
+    # ce_dice is implemented via unified_focal with focal weighting removed
+    # (lambda=0.5 blends CE and Tversky/Dice; gamma=1.0, delta=0.5 recovers
+    # a plain CE+Dice combo — functionally equivalent and already supported
+    # by geoai's get_landcover_loss_function).
+    if loss_function == "ce_dice":
+        loss_function = "unified_focal"
+        ufl_lambda = 0.5
+        ufl_gamma = 1.0
+        ufl_delta = 0.5
     if not (0 < val_split < 1):
         raise ValueError(f"val_split must be in (0, 1), got {val_split}")
     if num_epochs <= 0:
@@ -1802,6 +1903,9 @@ def train_wetland_model(
         ignore_index=ignore_index,
         focal_alpha=focal_alpha,
         focal_gamma=focal_gamma,
+        ufl_lambda=ufl_lambda,
+        ufl_gamma=ufl_gamma,
+        ufl_delta=ufl_delta,
         max_class_weight=max_class_weight,
         device=resolved_device,
         verbose=True,

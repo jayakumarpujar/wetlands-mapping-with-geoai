@@ -44,7 +44,7 @@ class TestCowardinClasses(unittest.TestCase):
     def test_contains_expected_classes(self):
         from research_paper.wetland import COWARDIN_CLASSES
 
-        expected = {0: "Upland", 1: "Water", 2: "Emergent", 3: "Forested", 4: "Scrub-Shrub"}
+        expected = {0: "Upland", 1: "Water", 2: "Emergent", 3: "Other"}
         for key, val in expected.items():
             self.assertIn(key, COWARDIN_CLASSES)
             self.assertEqual(COWARDIN_CLASSES[key], val)
@@ -98,7 +98,7 @@ class TestNWICodeToClass(unittest.TestCase):
     def test_scrub_shrub_code(self):
         from research_paper.wetland import NWI_CODE_TO_CLASS
 
-        self.assertEqual(NWI_CODE_TO_CLASS["PSS"], 4)
+        self.assertEqual(NWI_CODE_TO_CLASS["PSS"], 3)
 
 
 class TestNAIPBands(unittest.TestCase):
@@ -232,7 +232,7 @@ class TestParseNWICode(unittest.TestCase):
     def test_palustrine_scrub_shrub(self):
         from research_paper.wetland import _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code("PSS1A"), 4)
+        self.assertEqual(_parse_nwi_code("PSS1A"), 3)
 
     def test_palustrine_open_water(self):
         from research_paper.wetland import _parse_nwi_code
@@ -242,17 +242,17 @@ class TestParseNWICode(unittest.TestCase):
     def test_unknown_code_returns_other(self):
         from research_paper.wetland import _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code("XYZABC"), 5)
+        self.assertEqual(_parse_nwi_code("XYZABC"), 3)
 
     def test_empty_string_returns_other(self):
         from research_paper.wetland import _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code(""), 5)
+        self.assertEqual(_parse_nwi_code(""), 3)
 
     def test_none_returns_other(self):
         from research_paper.wetland import _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code(None), 5)
+        self.assertEqual(_parse_nwi_code(None), 3)
 
     def test_case_insensitive_prefix(self):
         from research_paper.wetland import _parse_nwi_code
