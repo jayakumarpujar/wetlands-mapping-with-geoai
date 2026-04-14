@@ -478,6 +478,7 @@ def run_weak_labels(
             label_path=weak_label_path,
             output_dir=tiles_dir,
             tile_size=config["training"]["tile_size"],
+            stride=config["training"].get("tile_stride"),
             min_wetland_fraction=config["training"].get(
                 "min_wetland_fraction", 0.05
             ),

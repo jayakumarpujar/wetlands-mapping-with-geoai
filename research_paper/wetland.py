@@ -99,6 +99,7 @@ PPR_STUDY_AREA: Dict[str, Any] = {
 
 EXPERIMENT_DEFAULTS: Dict[str, Any] = {
     "tile_size": 256,
+    "tile_stride": None,
     "num_epochs": 100,
     "batch_size": 32,
     "learning_rate": 3e-4,

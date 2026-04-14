@@ -92,6 +92,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Training tile size in pixels (default: 256).",
     )
     train.add_argument(
+        "--tile-stride", type=int, default=None, metavar="PX",
+        help=(
+            "Stride between tiles in pixels (default: tile_size = no "
+            "overlap). Set to tile_size/2 for 50%% overlap and ~4x more "
+            "tiles when NAIP coverage is small."
+        ),
+    )
+    train.add_argument(
         "--val-split", type=float, default=0.2, metavar="F",
         help="Validation fraction 0-1 (default: 0.2).",
     )
@@ -289,6 +297,7 @@ def main() -> None:
         "weight_decay": args.weight_decay,
         "num_workers": args.num_workers,
         "tile_size": args.tile_size,
+        "tile_stride": args.tile_stride,
         "val_split": args.val_split,
         "loss_function": args.loss_function,
         "use_class_weights": not args.no_class_weights,
