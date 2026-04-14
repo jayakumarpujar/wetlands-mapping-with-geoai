@@ -1091,15 +1091,52 @@ def create_wetland_composite(
             )
             all_bands.append(dep_reproj)
 
+    # Per-band normalization to [0, 1].
+    # Why: geoai's dataset applies `image / 255.0` whenever max > 1.0. That
+    # crushes spectral indices ([-1,1] -> ~[-0.004, 0.004]) and depression
+    # depth (0-5m -> [0, 0.02]) to zero, killing the main wetland signals.
+    # Pre-normalizing keeps max <= 1 so geoai leaves the data alone.
+    num_epochs = len(naip_paths)
+    num_idx = len(index_names)
+    bands_per_epoch = 4 + num_idx
+    normalized: List[np.ndarray] = []
+    for e in range(num_epochs):
+        base = e * bands_per_epoch
+        # NAIP R,G,B,NIR: raw uint8 range, divide by 255.
+        for j in range(4):
+            b = all_bands[base + j].astype(np.float32)
+            normalized.append(np.clip(b / 255.0, 0.0, 1.0))
+        # Spectral indices: [-1, 1] -> [0, 1].
+        for j in range(num_idx):
+            b = all_bands[base + 4 + j].astype(np.float32)
+            b = np.where(np.isfinite(b), b, 0.0)
+            normalized.append(np.clip((b + 1.0) / 2.0, 0.0, 1.0))
+    # DEM elevation: min-max over the composite footprint.
+    dem_idx = num_epochs * bands_per_epoch
+    dem = all_bands[dem_idx].astype(np.float32)
+    dem_valid = dem[np.isfinite(dem)]
+    if dem_valid.size:
+        dem_min, dem_max = float(dem_valid.min()), float(dem_valid.max())
+        dem_range = max(dem_max - dem_min, 1e-6)
+        dem = np.where(np.isfinite(dem), (dem - dem_min) / dem_range, 0.0)
+    else:
+        dem = np.zeros_like(dem)
+    normalized.append(np.clip(dem, 0.0, 1.0).astype(np.float32))
+    # Depression depth: expected 0-5 m, clip to [0, 1] via /5.
+    if include_depressions:
+        dep = all_bands[dem_idx + 1].astype(np.float32)
+        dep = np.where(np.isfinite(dep), dep, 0.0)
+        normalized.append(np.clip(dep / 5.0, 0.0, 1.0))
+
     # Write composite
     ref_profile.update(
         dtype="float32",
-        count=len(all_bands),
+        count=len(normalized),
         nodata=None,
     )
 
     with rasterio.open(output_path, "w", **ref_profile) as dst:
-        for i, band in enumerate(all_bands, start=1):
+        for i, band in enumerate(normalized, start=1):
             dst.write(band, i)
 
     logger.info(
