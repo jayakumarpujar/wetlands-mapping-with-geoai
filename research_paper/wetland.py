@@ -460,7 +460,7 @@ def download_naip_timeseries(
     bbox: Tuple[float, float, float, float],
     output_dir: Union[str, Path],
     years: Optional[List[int]] = None,
-    max_items_per_year: int = 10,
+    max_items_per_year: int = 500,
     overwrite: bool = False,
     **kwargs: Any,
 ) -> Dict[int, List[str]]:
