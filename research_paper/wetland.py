@@ -1680,6 +1680,14 @@ def export_training_tiles(
 
                 comp_tile = comp_src.read(window=window)
 
+                # Drop tiles that fall in the NAIP coverage gap (all NAIP
+                # bands zero). NWI polygons rasterize on the full composite
+                # grid, so tiles can have valid labels but no imagery when
+                # the NAIP mosaic only covers part of the composite bbox.
+                naip_bands = comp_tile[:4]
+                if naip_bands.max() == 0:
+                    continue
+
                 tile_transform = rasterio.windows.transform(window, comp_src.transform)
 
                 img_profile = comp_src.profile.copy()
