@@ -224,23 +224,20 @@ def run_composites(
                 print(f"  NAIP mosaic for {year} already exists ({_ms.width}x{_ms.height}), reusing.", flush=True)
         else:
             print(f"  Mosaicking {len(year_files)} NAIP tiles for {year} ...", flush=True)
-            import subprocess, tempfile, os as _os
+            from osgeo import gdal as _gdal
             vrt_path = mosaic_path.replace(".tif", ".vrt")
             # Build VRT (virtual mosaic, disk-based, zero RAM) then translate to COG
-            subprocess.run(
-                ["gdalbuildvrt", vrt_path] + [str(f) for f in year_files],
-                check=True, capture_output=True,
-            )
-            subprocess.run(
-                [
-                    "gdal_translate", "-of", "GTiff",
-                    "-co", "COMPRESS=LZW", "-co", "PREDICTOR=2",
-                    "-co", "TILED=YES", "-co", "BLOCKXSIZE=512", "-co", "BLOCKYSIZE=512",
-                    "-co", "BIGTIFF=YES",
-                    vrt_path, mosaic_path,
+            _gdal.BuildVRT(vrt_path, [str(f) for f in year_files])
+            _gdal.Translate(
+                mosaic_path, vrt_path,
+                format="GTiff",
+                creationOptions=[
+                    "COMPRESS=LZW", "PREDICTOR=2",
+                    "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+                    "BIGTIFF=YES",
                 ],
-                check=True, capture_output=True,
             )
+            import os as _os
             _os.remove(vrt_path)
             with rasterio.open(mosaic_path) as _ms:
                 print(f"  Mosaic {year}: {_ms.width}x{_ms.height} pixels", flush=True)
