@@ -107,7 +107,7 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
         dem_path = merge_dem_tiles(
             tile_paths=pre_dem_tiles,
             output_path=paths["dem_path"],
-            bbox=bbox,
+            bbox=None,  # tiles already cover PPR bbox; skip clip to avoid CRS mismatch
             overwrite=True,
         )
     elif Path(paths["dem_path"]).exists():
