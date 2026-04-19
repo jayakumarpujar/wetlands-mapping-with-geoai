@@ -1199,8 +1199,12 @@ def reclassify_nwi(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    gdf = gpd.read_file(str(nwi_path))
-    print(f"  NWI: loaded {len(gdf)} polygons, columns: {list(gdf.columns)}", flush=True)
+    # Prefer ND_Wetlands layer; fall back to default if not present
+    import fiona as _fiona
+    _layers = _fiona.listlayers(str(nwi_path))
+    _layer = "ND_Wetlands" if "ND_Wetlands" in _layers else None
+    gdf = gpd.read_file(str(nwi_path), layer=_layer)
+    print(f"  NWI: loaded {len(gdf)} polygons from layer='{_layer}', columns: {list(gdf.columns)}", flush=True)
 
     with rasterio.open(raster_template) as tmpl:
         tmpl_crs = tmpl.crs
@@ -1280,24 +1284,10 @@ def reclassify_nwi(
         if class_id > 0 and row.geometry is not None and not row.geometry.is_empty:
             shapes.append((row.geometry, class_id))
 
-    print(f"  Rasterizing {len(shapes)} shapes into {tmpl_width}x{tmpl_height} grid ...", flush=True)
+    print(f"  Rasterizing {len(shapes)} shapes into {tmpl_width}x{tmpl_height} grid (chunked) ...", flush=True)
 
-    # Rasterize
-    if shapes:
-        out_arr = rasterize(
-            shapes,
-            out_shape=(tmpl_height, tmpl_width),
-            transform=tmpl_transform,
-            fill=0,
-            dtype=np.uint8,
-            all_touched=True,
-        )
-    else:
-        out_arr = np.zeros((tmpl_height, tmpl_width), dtype=np.uint8)
-
-    n_labeled = int(np.sum(out_arr > 0))
-    unique_classes = np.unique(out_arr[out_arr > 0]).tolist()
-    print(f"  Rasterized: {n_labeled} labeled pixels, classes: {unique_classes}", flush=True)
+    from rasterio.windows import Window as _Win
+    from rasterio.transform import Affine as _Affine
 
     profile = {
         "driver": "GTiff",
@@ -1307,9 +1297,38 @@ def reclassify_nwi(
         "width": tmpl_width,
         "crs": tmpl_crs,
         "transform": tmpl_transform,
+        "compress": "lzw",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+        "bigtiff": "YES",
     }
+    CHUNK = 4096
+    n_labeled = 0
+    unique_classes: set = set()
     with rasterio.open(output_path, "w", **profile) as dst:
-        dst.write(out_arr, 1)
+        for row in range(0, tmpl_height, CHUNK):
+            h = min(CHUNK, tmpl_height - row)
+            for col in range(0, tmpl_width, CHUNK):
+                w = min(CHUNK, tmpl_width - col)
+                win = _Win(col, row, w, h)
+                win_transform = dst.window_transform(win)
+                if shapes:
+                    chunk = rasterize(
+                        shapes,
+                        out_shape=(h, w),
+                        transform=win_transform,
+                        fill=0,
+                        dtype=np.uint8,
+                        all_touched=True,
+                    )
+                else:
+                    chunk = np.zeros((h, w), dtype=np.uint8)
+                n_labeled += int(np.sum(chunk > 0))
+                unique_classes.update(np.unique(chunk[chunk > 0]).tolist())
+                dst.write(chunk, 1, window=win)
+
+    print(f"  Rasterized: {n_labeled} labeled pixels, classes: {sorted(unique_classes)}", flush=True)
 
     logger.info(
         "Reclassified NWI (%d polygons, %d classes) -> %s",
