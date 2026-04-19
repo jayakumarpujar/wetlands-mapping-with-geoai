@@ -220,26 +220,26 @@ def run_composites(
                 print(f"  NAIP mosaic for {year} already exists ({_ms.width}x{_ms.height}), reusing.", flush=True)
         else:
             print(f"  Mosaicking {len(year_files)} NAIP tiles for {year} ...", flush=True)
-            src_files = [rasterio.open(f) for f in year_files]
-            mosaic_arr, mosaic_transform = rasterio_merge(src_files)
-            mosaic_profile = src_files[0].profile.copy()
-            mosaic_profile.update(
-                height=mosaic_arr.shape[1],
-                width=mosaic_arr.shape[2],
-                transform=mosaic_transform,
-                count=mosaic_arr.shape[0],
-                compress="lzw",
-                predictor=2,
-                tiled=True,
-                blockxsize=512,
-                blockysize=512,
-                bigtiff="YES",
+            import subprocess, tempfile, os as _os
+            vrt_path = mosaic_path.replace(".tif", ".vrt")
+            # Build VRT (virtual mosaic, disk-based, zero RAM) then translate to COG
+            subprocess.run(
+                ["gdalbuildvrt", vrt_path] + [str(f) for f in year_files],
+                check=True, capture_output=True,
             )
-            for s in src_files:
-                s.close()
-            with rasterio.open(mosaic_path, "w", **mosaic_profile) as dst:
-                dst.write(mosaic_arr)
-            print(f"  Mosaic {year}: {mosaic_arr.shape[2]}x{mosaic_arr.shape[1]} pixels", flush=True)
+            subprocess.run(
+                [
+                    "gdal_translate", "-of", "GTiff",
+                    "-co", "COMPRESS=LZW", "-co", "PREDICTOR=2",
+                    "-co", "TILED=YES", "-co", "BLOCKXSIZE=512", "-co", "BLOCKYSIZE=512",
+                    "-co", "BIGTIFF=YES",
+                    vrt_path, mosaic_path,
+                ],
+                check=True, capture_output=True,
+            )
+            _os.remove(vrt_path)
+            with rasterio.open(mosaic_path) as _ms:
+                print(f"  Mosaic {year}: {_ms.width}x{_ms.height} pixels", flush=True)
 
         # Compute spectral indices on the mosaic
         indices_path = str(composites_dir / f"indices_{year}.tif")
