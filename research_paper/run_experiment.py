@@ -290,7 +290,7 @@ def run_composites(
             from rasterio.windows import Window as _Win
             with rasterio.open(indices_path) as src:
                 profile = src.profile.copy()
-                profile.update(count=1)
+                profile.update(count=1, bigtiff="YES")
                 _ch = max(1, min(1024, src.height))
                 with rasterio.open(ndvi_path, "w", **profile) as dv, \
                      rasterio.open(ndwi_path, "w", **profile) as dw:
