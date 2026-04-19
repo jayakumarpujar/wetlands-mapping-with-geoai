@@ -103,13 +103,17 @@ def run_data_download(config: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("Using pre-downloaded DEM: %s", pre_dem_path)
         dem_path = str(pre_dem_path)
     elif pre_dem_tiles:
-        logger.info("Merging %d pre-downloaded DEM tiles ...", len(pre_dem_tiles))
-        dem_path = merge_dem_tiles(
-            tile_paths=pre_dem_tiles,
-            output_path=paths["dem_path"],
-            bbox=None,  # tiles already cover PPR bbox; skip clip to avoid CRS mismatch
-            overwrite=True,
-        )
+        if Path(paths["dem_path"]).exists():
+            logger.info("Merged DEM already exists, reusing: %s", paths["dem_path"])
+            dem_path = str(paths["dem_path"])
+        else:
+            logger.info("Merging %d pre-downloaded DEM tiles ...", len(pre_dem_tiles))
+            dem_path = merge_dem_tiles(
+                tile_paths=pre_dem_tiles,
+                output_path=paths["dem_path"],
+                bbox=None,  # tiles already cover PPR bbox; skip clip to avoid CRS mismatch
+                overwrite=False,
+            )
     elif Path(paths["dem_path"]).exists():
         logger.info("DEM already exists, reusing: %s", paths["dem_path"])
         dem_path = str(paths["dem_path"])
