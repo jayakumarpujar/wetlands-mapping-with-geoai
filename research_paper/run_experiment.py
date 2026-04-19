@@ -224,21 +224,43 @@ def run_composites(
                 print(f"  NAIP mosaic for {year} already exists ({_ms.width}x{_ms.height}), reusing.", flush=True)
         else:
             print(f"  Mosaicking {len(year_files)} NAIP tiles for {year} ...", flush=True)
-            from osgeo import gdal as _gdal
-            vrt_path = mosaic_path.replace(".tif", ".vrt")
-            # Build VRT (virtual mosaic, disk-based, zero RAM) then translate to COG
-            _gdal.BuildVRT(vrt_path, [str(f) for f in year_files])
-            _gdal.Translate(
-                mosaic_path, vrt_path,
-                format="GTiff",
-                creationOptions=[
-                    "COMPRESS=LZW", "PREDICTOR=2",
-                    "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
-                    "BIGTIFF=YES",
-                ],
-            )
-            import os as _os
-            _os.remove(vrt_path)
+            # Chunked mosaic — computes bounds from metadata (no pixels in RAM)
+            from rasterio.merge import merge as _merge
+            from rasterio.transform import from_bounds as _from_bounds
+            from rasterio.windows import Window
+            from rasterio.transform import array_bounds as _ab
+
+            src_files = [rasterio.open(f) for f in year_files]
+            try:
+                profile = src_files[0].profile.copy()
+                res_x = src_files[0].transform.a
+                res_y = abs(src_files[0].transform.e)
+                lefts  = [s.bounds.left   for s in src_files]
+                rights = [s.bounds.right  for s in src_files]
+                tops   = [s.bounds.top    for s in src_files]
+                bots   = [s.bounds.bottom for s in src_files]
+                out_left, out_right = min(lefts), max(rights)
+                out_bot,  out_top   = min(bots),  max(tops)
+                out_w = int(round((out_right - out_left) / res_x))
+                out_h = int(round((out_top   - out_bot)  / res_y))
+                out_transform = _from_bounds(out_left, out_bot, out_right, out_top, out_w, out_h)
+                profile.update(
+                    width=out_w, height=out_h, transform=out_transform,
+                    compress="lzw", predictor=2,
+                    tiled=True, blockxsize=512, blockysize=512, bigtiff="YES",
+                )
+                CHUNK = 4096
+                with rasterio.open(mosaic_path, "w", **profile) as dst:
+                    for row in range(0, out_h, CHUNK):
+                        for col in range(0, out_w, CHUNK):
+                            h = min(CHUNK, out_h - row)
+                            w = min(CHUNK, out_w - col)
+                            win_bounds = _ab(h, w, dst.window_transform(Window(col, row, w, h)))
+                            chunk, _ = _merge(src_files, bounds=win_bounds, res=(res_x, res_y))
+                            dst.write(chunk, window=Window(col, row, w, h))
+            finally:
+                for s in src_files:
+                    s.close()
             with rasterio.open(mosaic_path) as _ms:
                 print(f"  Mosaic {year}: {_ms.width}x{_ms.height} pixels", flush=True)
 
