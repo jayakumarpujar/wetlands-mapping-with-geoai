@@ -214,6 +214,16 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="Path to pre-downloaded NWI .gpkg or .shp file (skips USFWS API).",
     )
+    data.add_argument(
+        "--dem-resolution",
+        type=int,
+        default=10,
+        choices=[1, 3, 10, 30, 60],
+        metavar="M",
+        help="3DEP DEM resolution in meters when downloading via API "
+             "(default: 10). Full PPR bbox at 1m is ~50GB and will timeout; "
+             "use 3 or 10 for full-extent downloads.",
+    )
 
     # --- Logging ---
     p.add_argument(
@@ -321,6 +331,7 @@ def main() -> None:
         overrides["pre_downloaded_dem_tiles"] = args.dem_tiles
     if args.nwi_path:
         overrides["pre_downloaded_nwi"] = args.nwi_path
+    overrides["dem_resolution"] = args.dem_resolution
 
     log.info("Starting experiment ...")
     t0 = time.time()
