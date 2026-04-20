@@ -1287,7 +1287,11 @@ def reclassify_nwi(
     print(f"  Rasterizing {len(shapes)} shapes into {tmpl_width}x{tmpl_height} grid (chunked) ...", flush=True)
 
     from rasterio.windows import Window as _Win
-    from rasterio.transform import Affine as _Affine
+    from shapely.strtree import STRtree
+
+    # Build spatial index for fast bounds queries
+    geoms = [s[0] for s in shapes]
+    tree = STRtree(geoms)
 
     profile = {
         "driver": "GTiff",
@@ -1313,9 +1317,16 @@ def reclassify_nwi(
                 w = min(CHUNK, tmpl_width - col)
                 win = _Win(col, row, w, h)
                 win_transform = dst.window_transform(win)
-                if shapes:
+                # Query spatial index for shapes in this chunk
+                from rasterio.transform import array_bounds as _ab
+                win_bounds = _ab(h, w, win_transform)
+                from shapely.geometry import box as _box
+                win_geom = _box(*win_bounds)
+                overlap_idxs = list(tree.query(win_geom))
+                chunk_shapes = [shapes[i] for i in overlap_idxs] if overlap_idxs else []
+                if chunk_shapes:
                     chunk = rasterize(
-                        shapes,
+                        chunk_shapes,
                         out_shape=(h, w),
                         transform=win_transform,
                         fill=0,
