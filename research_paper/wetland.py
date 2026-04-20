@@ -1438,158 +1438,192 @@ def generate_weak_labels(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Read inputs
+    # Chunked/windowed weak-label generation.
+    # Full-raster loads (12.5GB labels + 50GB float32 NDVI/NDWI + 50GB int32
+    # component labels) previously OOM-killed even high-mem HPC nodes.
+    # We now stream in CHUNK×CHUNK windows so peak RAM is bounded per chunk.
+    # Step 4 (connected components) is computed per chunk; PPR wetlands rarely
+    # span >4km so 4096-pixel chunks at 1m resolution keep boundary effects
+    # negligible.
     import rasterio
-    from rasterio.warp import Resampling, reproject
+    from rasterio.warp import Resampling
+    from rasterio.vrt import WarpedVRT
+    from rasterio.windows import Window as _Win
 
     with rasterio.open(nwi_raster_path) as src:
-        labels = src.read(1).astype(np.uint8)
         profile = src.profile.copy()
-        ref_shape = labels.shape
+        ref_height = src.height
+        ref_width = src.width
         ref_transform = src.transform
         ref_crs = src.crs
 
-    with rasterio.open(depression_path) as src:
-        dep_nodata = src.nodata
-        # Reproject/resample depression to match NWI raster grid if shapes differ
-        if (src.height, src.width) != ref_shape or src.crs != ref_crs:
-            dep_data = np.empty(ref_shape, dtype=np.float32)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=dep_data,
-                src_nodata=dep_nodata,
-                dst_transform=ref_transform,
-                dst_crs=ref_crs,
-                dst_nodata=dep_nodata if dep_nodata is not None else -9999,
-                resampling=Resampling.bilinear,
-            )
-        else:
-            dep_data = src.read(1).astype(np.float32)
+    # Open all sources up-front; close at the end.
+    nwi_src = rasterio.open(nwi_raster_path)
+    dep_src = rasterio.open(depression_path)
+    dep_nodata = dep_src.nodata
 
-    # Step 1: Start with NWI labels
-    reliable = labels > 0  # mask of pixels with any label
-    n_nwi = int(np.sum(reliable))
-    print(f"  Weak labels step 1 (NWI): {n_nwi} labeled pixels", flush=True)
-
-    if n_nwi == 0:
-        # No NWI labels in the study area — write empty and return early
-        profile.update(dtype="uint8", count=1, nodata=0)
-        with rasterio.open(output_path, "w", **profile) as dst:
-            dst.write(labels, 1)
-        logger.warning("No NWI wetland labels found in study area.")
-        return str(output_path)
-
-    # Step 2: Depression filter — keep only wetland pixels in depressions
-    dep_valid = dep_data > depression_threshold
-    if dep_nodata is not None:
-        dep_valid &= dep_data != dep_nodata
-    reliable &= dep_valid
-    del dep_data, dep_valid
-    n_dep = int(np.sum(reliable))
-    print(f"  Weak labels step 2 (depression filter): {n_dep} pixels remain "
-          f"({100*n_dep/max(n_nwi,1):.1f}%)", flush=True)
-
-    # Helper: read a single-band raster, reprojecting to ref grid if needed
-    def _read_aligned(path: Union[str, Path]) -> np.ndarray:
-        with rasterio.open(path) as src:
-            if (src.height, src.width) != ref_shape:
-                arr = np.empty(ref_shape, dtype=np.float32)
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=arr,
-                    dst_transform=ref_transform,
-                    dst_crs=ref_crs,
-                    resampling=Resampling.bilinear,
-                )
-                return arr
-            return src.read(1).astype(np.float32)
-
-    # Step 3: Temporal stability filter
-    # Optimized: reuse single buffer, subtract in-place, avoid 3 simultaneous
-    # full-size float32 arrays. Peak RAM: 2 × 10GB instead of 3 × 10GB.
-    if len(ndvi_paths) >= 2:
-        for i in range(len(ndvi_paths) - 1):
-            arr1 = _read_aligned(ndvi_paths[i])
-            arr2 = _read_aligned(ndvi_paths[i + 1])
-            np.subtract(arr2, arr1, out=arr1)  # reuse arr1 buffer
-            np.abs(arr1, out=arr1)
-            reliable &= arr1 <= stability_threshold
-            del arr1, arr2
-
-        for i in range(len(ndwi_paths) - 1):
-            arr1 = _read_aligned(ndwi_paths[i])
-            arr2 = _read_aligned(ndwi_paths[i + 1])
-            np.subtract(arr2, arr1, out=arr1)
-            np.abs(arr1, out=arr1)
-            reliable &= arr1 <= stability_threshold
-            del arr1, arr2
-
-    n_stable = int(np.sum(reliable))
-    print(f"  Weak labels step 3 (stability filter, thresh={stability_threshold}): "
-          f"{n_stable} pixels remain ({100*n_stable/max(n_nwi,1):.1f}%)", flush=True)
-
-    # Step 4: Object-level confidence filtering
-    # Vectorized with np.bincount — O(n) instead of O(n × num_components).
-    # Old code looped over every component creating a full-size boolean mask
-    # each iteration → catastrophic on 2.47B pixel rasters with millions of
-    # small wetland components.
-    output_labels = np.zeros_like(labels)
-    unique_classes = [c for c in np.unique(labels) if c > 0]
-    struct = ndimage.generate_binary_structure(2, 1)  # 4-connected
-
-    for cls in unique_classes:
-        cls_mask = labels == cls
-        comp_labels, num_comps = ndimage.label(cls_mask, structure=struct)
-        del cls_mask
-
-        if num_comps == 0:
-            continue
-
-        # Vectorized: count total and reliable pixels per component in O(n)
-        flat_comp = comp_labels.ravel()
-        flat_reliable = reliable.ravel()
-
-        total_per_comp = np.bincount(flat_comp, minlength=num_comps + 1)
-        reliable_per_comp = np.bincount(
-            flat_comp, weights=flat_reliable.astype(np.float32), minlength=num_comps + 1
+    # Wrap depression in WarpedVRT if grid differs, so .read(window=...) gives
+    # a chunk already aligned to the NWI grid.
+    if (dep_src.height, dep_src.width) != (ref_height, ref_width) or dep_src.crs != ref_crs:
+        dep_vrt = WarpedVRT(
+            dep_src,
+            crs=ref_crs,
+            transform=ref_transform,
+            width=ref_width,
+            height=ref_height,
+            resampling=Resampling.bilinear,
+            src_nodata=dep_nodata,
+            nodata=dep_nodata if dep_nodata is not None else -9999,
         )
+        dep_reader = dep_vrt
+    else:
+        dep_vrt = None
+        dep_reader = dep_src
 
-        # Fraction of reliable pixels per component (skip background=0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            frac = np.where(
-                total_per_comp > 0,
-                reliable_per_comp / total_per_comp,
-                0.0,
-            )
+    ndvi_srcs = [rasterio.open(p) for p in ndvi_paths]
+    ndwi_srcs = [rasterio.open(p) for p in ndwi_paths]
 
-        # Build keep mask: which component IDs pass threshold
-        keep_ids = frac >= min_component_fraction
-        keep_ids[0] = False  # background never kept
+    def _aligned_read(src, window: _Win) -> np.ndarray:
+        """Read a window from src, WarpedVRT-reprojected if shape differs."""
+        if (src.height, src.width) == (ref_height, ref_width) and src.crs == ref_crs:
+            return src.read(1, window=window).astype(np.float32)
+        vrt = WarpedVRT(
+            src,
+            crs=ref_crs,
+            transform=ref_transform,
+            width=ref_width,
+            height=ref_height,
+            resampling=Resampling.bilinear,
+        )
+        try:
+            return vrt.read(1, window=window).astype(np.float32)
+        finally:
+            vrt.close()
 
-        # Map back: vectorized lookup instead of per-component loop
-        output_labels[keep_ids[comp_labels]] = cls
-        del comp_labels, flat_comp, flat_reliable, total_per_comp
-        del reliable_per_comp, frac, keep_ids
+    profile.update(dtype="uint8", count=1, nodata=0, compress="lzw",
+                   tiled=True, blockxsize=512, blockysize=512, bigtiff="YES")
 
-    # Write output — strip tiling params to avoid BLOCKXSIZE warning
-    profile.update(dtype="uint8", count=1, nodata=0, tiled=False)
-    profile.pop("blockxsize", None)
-    profile.pop("blockysize", None)
-    with rasterio.open(output_path, "w", **profile) as dst:
-        dst.write(output_labels.astype(np.uint8), 1)
+    CHUNK = 4096
+    struct = ndimage.generate_binary_structure(2, 1)  # 4-connected
+    n_nwi_total = 0
+    n_dep_total = 0
+    n_stable_total = 0
+    retained_total = 0
+    do_temporal = len(ndvi_paths) >= 2
 
-    retained = int(np.sum(output_labels > 0))
-    original = int(np.sum(labels > 0))
+    try:
+        with rasterio.open(output_path, "w", **profile) as dst:
+            for row in range(0, ref_height, CHUNK):
+                h = min(CHUNK, ref_height - row)
+                for col in range(0, ref_width, CHUNK):
+                    w = min(CHUNK, ref_width - col)
+                    win = _Win(col, row, w, h)
+
+                    labels_chunk = nwi_src.read(1, window=win).astype(np.uint8)
+                    if not labels_chunk.any():
+                        # No labels in this chunk — write zeros and move on.
+                        dst.write(np.zeros((h, w), dtype=np.uint8), 1, window=win)
+                        continue
+
+                    reliable = labels_chunk > 0
+                    n_nwi_total += int(reliable.sum())
+
+                    # Step 2: depression filter
+                    dep_chunk = dep_reader.read(1, window=win).astype(np.float32)
+                    dep_valid = dep_chunk > depression_threshold
+                    if dep_nodata is not None:
+                        dep_valid &= dep_chunk != dep_nodata
+                    reliable &= dep_valid
+                    del dep_chunk, dep_valid
+                    n_dep_total += int(reliable.sum())
+
+                    # Step 3: temporal stability filter on NDVI + NDWI
+                    if do_temporal and reliable.any():
+                        for i in range(len(ndvi_srcs) - 1):
+                            a = _aligned_read(ndvi_srcs[i], win)
+                            b = _aligned_read(ndvi_srcs[i + 1], win)
+                            np.subtract(b, a, out=a)
+                            np.abs(a, out=a)
+                            reliable &= a <= stability_threshold
+                            del a, b
+                            if not reliable.any():
+                                break
+                        if reliable.any():
+                            for i in range(len(ndwi_srcs) - 1):
+                                a = _aligned_read(ndwi_srcs[i], win)
+                                b = _aligned_read(ndwi_srcs[i + 1], win)
+                                np.subtract(b, a, out=a)
+                                np.abs(a, out=a)
+                                reliable &= a <= stability_threshold
+                                del a, b
+                                if not reliable.any():
+                                    break
+                    n_stable_total += int(reliable.sum())
+
+                    # Step 4: per-chunk connected-component confidence filter.
+                    out_chunk = np.zeros_like(labels_chunk)
+                    for cls in np.unique(labels_chunk):
+                        if cls == 0:
+                            continue
+                        cls_mask = labels_chunk == cls
+                        comp_labels, num_comps = ndimage.label(cls_mask, structure=struct)
+                        del cls_mask
+                        if num_comps == 0:
+                            continue
+                        flat_comp = comp_labels.ravel()
+                        flat_reliable = reliable.ravel()
+                        total_per_comp = np.bincount(flat_comp, minlength=num_comps + 1)
+                        reliable_per_comp = np.bincount(
+                            flat_comp,
+                            weights=flat_reliable.astype(np.float32),
+                            minlength=num_comps + 1,
+                        )
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            frac = np.where(
+                                total_per_comp > 0,
+                                reliable_per_comp / total_per_comp,
+                                0.0,
+                            )
+                        keep_ids = frac >= min_component_fraction
+                        keep_ids[0] = False
+                        out_chunk[keep_ids[comp_labels]] = cls
+                        del comp_labels, flat_comp, flat_reliable
+                        del total_per_comp, reliable_per_comp, frac, keep_ids
+
+                    retained_total += int((out_chunk > 0).sum())
+                    dst.write(out_chunk, 1, window=win)
+                    del labels_chunk, reliable, out_chunk
+
+                print(
+                    f"  Weak labels: row {row + h}/{ref_height} done "
+                    f"(nwi={n_nwi_total}, dep={n_dep_total}, "
+                    f"stable={n_stable_total}, kept={retained_total})",
+                    flush=True,
+                )
+    finally:
+        nwi_src.close()
+        if dep_vrt is not None:
+            dep_vrt.close()
+        dep_src.close()
+        for s in ndvi_srcs:
+            s.close()
+        for s in ndwi_srcs:
+            s.close()
+
+    if n_nwi_total == 0:
+        logger.warning("No NWI wetland labels found in study area.")
+
     print(
-        f"  Weak labels step 4 (component filter): {retained}/{original} pixels "
-        f"retained ({100*retained/max(original,1):.1f}%)",
+        f"  Weak labels: step1={n_nwi_total} step2(dep)={n_dep_total} "
+        f"step3(stable)={n_stable_total} step4(kept)={retained_total} "
+        f"({100 * retained_total / max(n_nwi_total, 1):.1f}% of NWI retained)",
         flush=True,
     )
     logger.info(
         "Generated weak labels: %d/%d pixels retained (%.1f%%) -> %s",
-        retained,
-        original,
-        100 * retained / max(original, 1),
+        retained_total,
+        n_nwi_total,
+        100 * retained_total / max(n_nwi_total, 1),
         output_path,
     )
     return str(output_path)
