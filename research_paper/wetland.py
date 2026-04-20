@@ -1215,9 +1215,33 @@ def reclassify_nwi(
     print(f"  Template grid: {tmpl_width}x{tmpl_height}, CRS={tmpl_crs}, "
           f"bounds={tmpl_bounds}", flush=True)
 
-    # Reproject NWI to template CRS if needed
+    # Clip NWI to template extent FIRST (in source CRS) to reduce shape count before reprojection
+    print(f"  Clipping {len(gdf)} polygons to template extent (source CRS) ...", flush=True)
+    from shapely.geometry import box as shapely_box
+    # Convert template bounds to source CRS for clipping
     if gdf.crs and not gdf.crs.equals(tmpl_crs):
-        print(f"  Reprojecting NWI from {gdf.crs} to {tmpl_crs} ...", flush=True)
+        from rasterio.crs import CRS as _CRS
+        # Reproject template bounds to source CRS
+        from rasterio.warp import calculate_default_transform, transform_bounds
+        tfm_bounds = transform_bounds(tmpl_crs, gdf.crs,
+                                      tmpl_bounds.left, tmpl_bounds.bottom,
+                                      tmpl_bounds.right, tmpl_bounds.top)
+        clip_geom = shapely_box(*tfm_bounds)
+    else:
+        clip_geom = shapely_box(tmpl_bounds.left, tmpl_bounds.bottom,
+                                tmpl_bounds.right, tmpl_bounds.top)
+    try:
+        gdf_clipped = gpd.clip(gdf, clip_geom)
+        n_clipped = len(gdf_clipped)
+        print(f"  NWI: {n_clipped} polygons within template extent (gpd.clip in source CRS)", flush=True)
+        if n_clipped > 0:
+            gdf = gdf_clipped
+    except Exception as clip_err:
+        print(f"  WARNING: gpd.clip failed ({clip_err}), using all {len(gdf)} polygons", flush=True)
+
+    # Reproject NWI to template CRS if needed (fewer shapes now)
+    if gdf.crs and not gdf.crs.equals(tmpl_crs):
+        print(f"  Reprojecting {len(gdf)} NWI polygons to {tmpl_crs} ...", flush=True)
         gdf = gdf.to_crs(tmpl_crs)
 
     # Fix invalid geometries created by reprojection
@@ -1228,25 +1252,6 @@ def reclassify_nwi(
         gdf.geometry = gdf.geometry.apply(
             lambda g: make_valid(g) if g is not None and not g.is_valid else g
         )
-
-    nwi_bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
-    print(f"  NWI bounds (reprojected): minx={nwi_bounds[0]:.0f}, miny={nwi_bounds[1]:.0f}, "
-          f"maxx={nwi_bounds[2]:.0f}, maxy={nwi_bounds[3]:.0f}", flush=True)
-    print(f"  Template bounds: left={tmpl_bounds.left:.0f}, bottom={tmpl_bounds.bottom:.0f}, "
-          f"right={tmpl_bounds.right:.0f}, top={tmpl_bounds.top:.0f}", flush=True)
-
-    # Clip NWI to template extent using geopandas clip (robust)
-    from shapely.geometry import box as shapely_box
-    clip_geom = shapely_box(tmpl_bounds.left, tmpl_bounds.bottom,
-                            tmpl_bounds.right, tmpl_bounds.top)
-    try:
-        gdf_clipped = gpd.clip(gdf, clip_geom)
-        n_clipped = len(gdf_clipped)
-        print(f"  NWI: {n_clipped} polygons within template extent (gpd.clip)", flush=True)
-        if n_clipped > 0:
-            gdf = gdf_clipped
-    except Exception as clip_err:
-        print(f"  WARNING: gpd.clip failed ({clip_err}), using all polygons", flush=True)
 
     # Detect attribute field — NWI REST API prefixes with 'Wetlands.'
     attr_candidates = [
