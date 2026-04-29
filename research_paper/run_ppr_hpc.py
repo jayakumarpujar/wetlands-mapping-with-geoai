@@ -84,8 +84,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optimizer weight decay (default: 1e-4).",
     )
     train.add_argument(
-        "--num-workers", type=int, default=8, metavar="N",
-        help="DataLoader worker processes — set to CPU count (default: 8).",
+        "--num-workers", type=int, default=4, metavar="N",
+        help="DataLoader worker processes (default: 4).",
     )
     train.add_argument(
         "--tile-size", type=int, default=256, metavar="PX",
