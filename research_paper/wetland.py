@@ -510,8 +510,6 @@ def download_naip_timeseries(
                     year=year,
                     max_items=max_items_per_year,
                     overwrite=overwrite,
-                    timeout=timeout,
-                    **kwargs,
                 )
                 if files:
                     results[year] = files
@@ -2244,19 +2242,17 @@ def predict_wetlands(
     model.to(resolved_device)
     model.eval()
 
-    # Run sliding-window inference
+    # Run sliding-window inference in horizontal strips to avoid OOM.
+    # Each strip is `strip_height` rows tall (with overlap for blending).
+    from rasterio.windows import Window
+
     with rasterio.open(composite_path) as src:
         height = src.height
         width = src.width
         profile = src.profile.copy()
 
-        # Accumulate softmax probabilities for blending
-        prob_acc = np.zeros((num_classes, height, width), dtype=np.float64)
-        count_acc = np.zeros((height, width), dtype=np.float64)
-
         stride = tile_size - overlap
 
-        # Build row/column offsets ensuring full coverage
         def _offsets(total: int, tile: int, step: int) -> List[int]:
             offsets = list(range(0, max(total - tile, 0) + 1, step))
             last = max(0, total - tile)
@@ -2264,69 +2260,86 @@ def predict_wetlands(
                 offsets.append(last)
             return offsets
 
-        row_offsets = _offsets(height, tile_size, stride)
         col_offsets = _offsets(width, tile_size, stride)
-        windows = [(r, c) for r in row_offsets for c in col_offsets]
 
-        # Process in batches
-        for batch_start in range(0, len(windows), batch_size):
-            batch_windows = windows[batch_start: batch_start + batch_size]
-            tiles = []
+        strip_height = max(tile_size * 16, 4096)
+        strip_stride = strip_height - overlap
 
-            for r, c in batch_windows:
-                from rasterio.windows import Window
+        profile.update(dtype="uint8", count=1, nodata=None)
+        with rasterio.open(output_path, "w", **profile) as dst:
+            for strip_top in range(0, height, strip_stride):
+                strip_bot = min(strip_top + strip_height, height)
+                s_h = strip_bot - strip_top
 
-                win = Window(c, r, tile_size, tile_size)
-                tile = src.read(window=win).astype(np.float32)
+                prob_acc = np.zeros((num_classes, s_h, width), dtype=np.float32)
+                count_acc = np.zeros((s_h, width), dtype=np.float32)
 
-                # Handle edge tiles smaller than tile_size
-                actual_h, actual_w = tile.shape[1], tile.shape[2]
-                if actual_h < tile_size or actual_w < tile_size:
-                    padded = np.zeros(
-                        (in_channels, tile_size, tile_size), dtype=np.float32
-                    )
-                    padded[:, :actual_h, :actual_w] = tile
-                    tile = padded
+                row_offsets = _offsets(s_h, tile_size, stride)
+                windows = [(r, c) for r in row_offsets for c in col_offsets]
 
-                # Clip or pad channels
-                if tile.shape[0] > in_channels:
-                    tile = tile[:in_channels]
-                elif tile.shape[0] < in_channels:
-                    pad = np.zeros(
-                        (in_channels - tile.shape[0], tile_size, tile_size),
-                        dtype=np.float32,
-                    )
-                    tile = np.concatenate([tile, pad], axis=0)
+                for batch_start in range(0, len(windows), batch_size):
+                    batch_windows = windows[batch_start: batch_start + batch_size]
+                    tiles = []
 
-                tiles.append(tile)
+                    for r, c in batch_windows:
+                        win = Window(c, strip_top + r, tile_size, tile_size)
+                        tile = src.read(window=win).astype(np.float32)
 
-            batch_tensor = torch.from_numpy(np.stack(tiles)).to(resolved_device)
+                        actual_h, actual_w = tile.shape[1], tile.shape[2]
+                        if actual_h < tile_size or actual_w < tile_size:
+                            padded = np.zeros(
+                                (in_channels, tile_size, tile_size), dtype=np.float32
+                            )
+                            padded[:, :actual_h, :actual_w] = tile
+                            tile = padded
 
-            with torch.no_grad():
-                logits = model(batch_tensor)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                        if tile.shape[0] > in_channels:
+                            tile = tile[:in_channels]
+                        elif tile.shape[0] < in_channels:
+                            pad = np.zeros(
+                                (in_channels - tile.shape[0], tile_size, tile_size),
+                                dtype=np.float32,
+                            )
+                            tile = np.concatenate([tile, pad], axis=0)
 
-            # Accumulate predictions
-            for idx, (r, c) in enumerate(batch_windows):
-                h_end = min(r + tile_size, height)
-                w_end = min(c + tile_size, width)
-                th = h_end - r
-                tw = w_end - c
+                        tiles.append(tile)
 
-                prob_acc[:, r:h_end, c:w_end] += probs[idx, :, :th, :tw]
-                count_acc[r:h_end, c:w_end] += 1.0
+                    batch_tensor = torch.from_numpy(np.stack(tiles)).to(resolved_device)
 
-    # Avoid division by zero
-    count_acc = np.maximum(count_acc, 1.0)
-    avg_probs = prob_acc / count_acc[np.newaxis, :, :]
+                    with torch.no_grad():
+                        logits = model(batch_tensor)
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()
 
-    # Argmax to get class predictions
-    prediction = np.argmax(avg_probs, axis=0).astype(np.uint8)
+                    for idx, (r, c) in enumerate(batch_windows):
+                        h_end = min(r + tile_size, s_h)
+                        w_end = min(c + tile_size, width)
+                        th = h_end - r
+                        tw = w_end - c
+                        prob_acc[:, r:h_end, c:w_end] += probs[idx, :, :th, :tw]
+                        count_acc[r:h_end, c:w_end] += 1.0
 
-    # Write output
-    profile.update(dtype="uint8", count=1, nodata=None)
-    with rasterio.open(output_path, "w", **profile) as dst:
-        dst.write(prediction, 1)
+                count_acc = np.maximum(count_acc, 1.0)
+                avg_probs = prob_acc / count_acc[np.newaxis, :, :]
+                strip_pred = np.argmax(avg_probs, axis=0).astype(np.uint8)
+
+                write_top = strip_top
+                if strip_top > 0:
+                    trim = overlap // 2
+                    strip_pred = strip_pred[trim:]
+                    write_top += trim
+
+                write_h = min(strip_pred.shape[0], height - write_top)
+                strip_pred = strip_pred[:write_h]
+
+                win_out = Window(0, write_top, width, write_h)
+                dst.write(strip_pred[np.newaxis, :, :], window=win_out)
+
+                logger.info(
+                    "Inference strip %d-%d / %d written",
+                    write_top, write_top + write_h, height,
+                )
+
+                del prob_acc, count_acc, avg_probs, strip_pred
 
     logger.info("Inference complete -> %s", output_path)
     return str(output_path)
