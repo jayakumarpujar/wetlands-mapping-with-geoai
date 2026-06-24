@@ -2243,7 +2243,9 @@ def predict_wetlands(
     model.eval()
 
     # Run sliding-window inference in horizontal strips to avoid OOM.
-    # Each strip is `strip_height` rows tall (with overlap for blending).
+    # Reads each strip into RAM once (sequential I/O) then slices tiles
+    # from the in-memory array — avoids slow per-tile random disk reads.
+    import time as _time
     from rasterio.windows import Window
 
     with rasterio.open(composite_path) as src:
@@ -2264,26 +2266,41 @@ def predict_wetlands(
 
         strip_height = max(tile_size * 16, 4096)
         strip_stride = strip_height - overlap
+        num_strips = len(range(0, height, strip_stride))
+
+        print(
+            f"Inference: {height}x{width} composite, "
+            f"{num_strips} strips, tile={tile_size}, overlap={overlap}",
+            flush=True,
+        )
 
         profile.update(dtype="uint8", count=1, nodata=None)
+        t0 = _time.time()
         with rasterio.open(output_path, "w", **profile) as dst:
-            for strip_top in range(0, height, strip_stride):
+            for strip_idx, strip_top in enumerate(range(0, height, strip_stride)):
                 strip_bot = min(strip_top + strip_height, height)
                 s_h = strip_bot - strip_top
+
+                strip_win = Window(0, strip_top, width, s_h)
+                strip_data = src.read(window=strip_win).astype(np.float32)
 
                 prob_acc = np.zeros((num_classes, s_h, width), dtype=np.float32)
                 count_acc = np.zeros((s_h, width), dtype=np.float32)
 
                 row_offsets = _offsets(s_h, tile_size, stride)
                 windows = [(r, c) for r in row_offsets for c in col_offsets]
+                n_batches = (len(windows) + batch_size - 1) // batch_size
 
-                for batch_start in range(0, len(windows), batch_size):
+                for batch_i, batch_start in enumerate(
+                    range(0, len(windows), batch_size)
+                ):
                     batch_windows = windows[batch_start: batch_start + batch_size]
                     tiles = []
 
                     for r, c in batch_windows:
-                        win = Window(c, strip_top + r, tile_size, tile_size)
-                        tile = src.read(window=win).astype(np.float32)
+                        tile = strip_data[
+                            :, r: r + tile_size, c: c + tile_size
+                        ].copy()
 
                         actual_h, actual_w = tile.shape[1], tile.shape[2]
                         if actual_h < tile_size or actual_w < tile_size:
@@ -2318,6 +2335,16 @@ def predict_wetlands(
                         prob_acc[:, r:h_end, c:w_end] += probs[idx, :, :th, :tw]
                         count_acc[r:h_end, c:w_end] += 1.0
 
+                    if (batch_i + 1) % 50 == 0 or batch_i == n_batches - 1:
+                        elapsed = _time.time() - t0
+                        print(
+                            f"  Strip {strip_idx+1}/{num_strips} "
+                            f"batch {batch_i+1}/{n_batches} "
+                            f"[{elapsed:.0f}s]",
+                            flush=True,
+                        )
+
+                del strip_data
                 count_acc = np.maximum(count_acc, 1.0)
                 avg_probs = prob_acc / count_acc[np.newaxis, :, :]
                 strip_pred = np.argmax(avg_probs, axis=0).astype(np.uint8)
