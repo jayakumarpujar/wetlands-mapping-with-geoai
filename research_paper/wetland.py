@@ -2264,7 +2264,7 @@ def predict_wetlands(
 
         col_offsets = _offsets(width, tile_size, stride)
 
-        strip_height = max(tile_size * 16, 4096)
+        strip_height = max(tile_size * 4, 1024)
         strip_stride = strip_height - overlap
         num_strips = len(range(0, height, strip_stride))
 
