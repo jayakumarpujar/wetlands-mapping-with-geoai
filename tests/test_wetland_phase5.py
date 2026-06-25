@@ -98,7 +98,7 @@ class TestExperimentDefaults(unittest.TestCase):
     def test_num_classes(self):
         from research_paper.wetland import EXPERIMENT_DEFAULTS
 
-        self.assertEqual(EXPERIMENT_DEFAULTS["num_classes"], 4)
+        self.assertEqual(EXPERIMENT_DEFAULTS["num_classes"], 3)
 
     def test_has_architecture_configs(self):
         from research_paper.wetland import EXPERIMENT_DEFAULTS

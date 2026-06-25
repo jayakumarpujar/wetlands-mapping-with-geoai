@@ -44,10 +44,8 @@ class TestCowardinClasses(unittest.TestCase):
     def test_contains_expected_classes(self):
         from research_paper.wetland import COWARDIN_CLASSES
 
-        expected = {0: "Upland", 1: "Water", 2: "Emergent", 3: "Other"}
-        for key, val in expected.items():
-            self.assertIn(key, COWARDIN_CLASSES)
-            self.assertEqual(COWARDIN_CLASSES[key], val)
+        expected = {0: "Upland", 1: "Water", 2: "Emergent"}
+        self.assertEqual(dict(COWARDIN_CLASSES), expected)
 
     def test_class_ids_are_contiguous(self):
         from research_paper.wetland import COWARDIN_CLASSES
@@ -71,9 +69,14 @@ class TestNWICodeToClass(unittest.TestCase):
             self.assertIsInstance(key, str)
 
     def test_values_are_valid_class_ids(self):
-        from research_paper.wetland import COWARDIN_CLASSES, NWI_CODE_TO_CLASS
+        from research_paper.wetland import (
+            COWARDIN_CLASSES,
+            IGNORE_INDEX,
+            NWI_CODE_TO_CLASS,
+        )
 
-        valid_ids = set(COWARDIN_CLASSES.keys())
+        # PFO/PSS map to IGNORE_INDEX (masked), all others to a real class.
+        valid_ids = set(COWARDIN_CLASSES.keys()) | {IGNORE_INDEX}
         for code, class_id in NWI_CODE_TO_CLASS.items():
             self.assertIn(
                 class_id, valid_ids, f"NWI code {code!r} maps to invalid class {class_id}"
@@ -91,14 +94,16 @@ class TestNWICodeToClass(unittest.TestCase):
         self.assertEqual(NWI_CODE_TO_CLASS["PEM"], 2)
 
     def test_forested_code(self):
-        from research_paper.wetland import NWI_CODE_TO_CLASS
+        from research_paper.wetland import IGNORE_INDEX, NWI_CODE_TO_CLASS
 
-        self.assertEqual(NWI_CODE_TO_CLASS["PFO"], 3)
+        # PFO (forested) is masked in treeless PPR — mapped to IGNORE_INDEX.
+        self.assertEqual(NWI_CODE_TO_CLASS["PFO"], IGNORE_INDEX)
 
     def test_scrub_shrub_code(self):
-        from research_paper.wetland import NWI_CODE_TO_CLASS
+        from research_paper.wetland import IGNORE_INDEX, NWI_CODE_TO_CLASS
 
-        self.assertEqual(NWI_CODE_TO_CLASS["PSS"], 3)
+        # PSS (scrub-shrub) is masked in treeless PPR — mapped to IGNORE_INDEX.
+        self.assertEqual(NWI_CODE_TO_CLASS["PSS"], IGNORE_INDEX)
 
 
 class TestNAIPBands(unittest.TestCase):
@@ -225,34 +230,36 @@ class TestParseNWICode(unittest.TestCase):
         self.assertEqual(_parse_nwi_code("PEM1Ch"), 2)
 
     def test_palustrine_forested(self):
-        from research_paper.wetland import _parse_nwi_code
+        from research_paper.wetland import IGNORE_INDEX, _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code("PFO1A"), 3)
+        # PFO is masked in treeless PPR.
+        self.assertEqual(_parse_nwi_code("PFO1A"), IGNORE_INDEX)
 
     def test_palustrine_scrub_shrub(self):
-        from research_paper.wetland import _parse_nwi_code
+        from research_paper.wetland import IGNORE_INDEX, _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code("PSS1A"), 3)
+        # PSS is masked in treeless PPR.
+        self.assertEqual(_parse_nwi_code("PSS1A"), IGNORE_INDEX)
 
     def test_palustrine_open_water(self):
         from research_paper.wetland import _parse_nwi_code
 
         self.assertEqual(_parse_nwi_code("POWHh"), 1)
 
-    def test_unknown_code_returns_other(self):
-        from research_paper.wetland import _parse_nwi_code
+    def test_unknown_code_returns_ignore(self):
+        from research_paper.wetland import IGNORE_INDEX, _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code("XYZABC"), 3)
+        self.assertEqual(_parse_nwi_code("XYZABC"), IGNORE_INDEX)
 
-    def test_empty_string_returns_other(self):
-        from research_paper.wetland import _parse_nwi_code
+    def test_empty_string_returns_ignore(self):
+        from research_paper.wetland import IGNORE_INDEX, _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code(""), 3)
+        self.assertEqual(_parse_nwi_code(""), IGNORE_INDEX)
 
-    def test_none_returns_other(self):
-        from research_paper.wetland import _parse_nwi_code
+    def test_none_returns_ignore(self):
+        from research_paper.wetland import IGNORE_INDEX, _parse_nwi_code
 
-        self.assertEqual(_parse_nwi_code(None), 3)
+        self.assertEqual(_parse_nwi_code(None), IGNORE_INDEX)
 
     def test_case_insensitive_prefix(self):
         from research_paper.wetland import _parse_nwi_code

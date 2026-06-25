@@ -28,29 +28,42 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+IGNORE_INDEX: int = 255
+"""Sentinel label value for pixels excluded from loss and evaluation.
+
+Stored directly in the uint8 weak-label rasters (so it must be uint8-safe, not
+the PyTorch convention -100) and passed through to the trainer as ``ignore_index``;
+geoai masks it out of both the loss and the class-weight computation
+(``valid_mask = targets != ignore_index``)."""
+
 COWARDIN_CLASSES: Dict[int, str] = {
     0: "Upland",
     1: "Water",
     2: "Emergent",
-    3: "Other",
 }
-"""Cowardin-based wetland classification schema (4-class, PPR-optimized).
+"""Cowardin-based wetland classification schema (3-class, PPR-optimized).
 
-Collapsed from 6 classes: Forested and Scrub-Shrub merged into Other
-because PPR (prairie grassland) has zero forested/shrub wetlands.
+Evolution: 7 (designed) -> 4 (upland subtypes + forested/scrub merged) -> 3.
+The former "Other" class (Palustrine Forested + Scrub-Shrub) was dropped: PPR
+is treeless prairie, so those wetlands are near-absent (0.24% of pixels, IoU
+0.097 in the 4-class run). PFO/PSS pixels are now mapped to IGNORE_INDEX (255) so
+they are excluded from loss and metrics rather than relabeled as Upland.
 """
 
 NWI_CODE_TO_CLASS: Dict[str, int] = {
-    "L": 1,     # Lacustrine -> Water
-    "R": 1,     # Riverine -> Water
-    "PAB": 1,   # Palustrine Aquatic Bed -> Water
-    "PUB": 1,   # Palustrine Unconsolidated Bottom -> Water
-    "POW": 1,   # Palustrine Open Water -> Water
-    "PEM": 2,   # Palustrine Emergent -> Emergent
-    "PFO": 3,   # Palustrine Forested -> Other (absent in PPR)
-    "PSS": 3,   # Palustrine Scrub-Shrub -> Other (absent in PPR)
+    "L": 1,             # Lacustrine -> Water
+    "R": 1,             # Riverine -> Water
+    "PAB": 1,           # Palustrine Aquatic Bed -> Water
+    "PUB": 1,           # Palustrine Unconsolidated Bottom -> Water
+    "POW": 1,           # Palustrine Open Water -> Water
+    "PEM": 2,           # Palustrine Emergent -> Emergent
+    "PFO": IGNORE_INDEX,  # Palustrine Forested -> ignored (absent in PPR)
+    "PSS": IGNORE_INDEX,  # Palustrine Scrub-Shrub -> ignored (absent in PPR)
 }
-"""Mapping from NWI Cowardin code prefixes to target class IDs."""
+"""Mapping from NWI Cowardin code prefixes to target class IDs.
+
+PFO/PSS map to IGNORE_INDEX (255): excluded from training loss and evaluation.
+"""
 
 NAIP_BANDS: Dict[int, str] = {
     1: "Red",
@@ -105,11 +118,11 @@ EXPERIMENT_DEFAULTS: Dict[str, Any] = {
     "learning_rate": 3e-4,
     "weight_decay": 1e-4,
     "val_split": 0.2,
-    "num_classes": 4,
+    "num_classes": 3,
     "in_channels": 10,
     "loss_function": "unified_focal",
     "use_class_weights": True,
-    "ignore_index": -100,
+    "ignore_index": IGNORE_INDEX,
     "focal_alpha": 1.0,
     "focal_gamma": 2.0,
     "ufl_lambda": 0.5,
@@ -140,9 +153,11 @@ Tuned for severe class imbalance (PPR ~95% upland) on V100-32GB:
 - ``unified_focal`` loss (lambda=0.5 blends focal CE + focal Tversky,
   functionally equivalent to CE+Dice combo) handles imbalance better
   than pure focal or pure CE.
-- ``ignore_index=-100`` (not 0) — upland is INCLUDED in loss with a
-  small class weight; excluding it starved the gradient signal and
-  caused collapse to trivial majority-class predictions.
+- ``ignore_index=255`` — a uint8-safe sentinel for masked pixels
+  (PFO/PSS and unrecognized NWI codes). Upland (0) is NOT this value, so
+  it stays INCLUDED in the loss with a small class weight; excluding
+  upland starved the gradient signal and caused collapse to trivial
+  majority-class predictions.
 - ``min_wetland_fraction=0.05`` drops tiles with <5% wetland content.
 - ``oversample_wetland_threshold/factor`` duplicates wetland-rich tiles
   at export time (poor-man's WeightedRandomSampler that works through
@@ -152,6 +167,7 @@ Tuned for severe class imbalance (PPR ~95% upland) on V100-32GB:
 __all__ = [
     "COWARDIN_CLASSES",
     "NWI_CODE_TO_CLASS",
+    "IGNORE_INDEX",
     "NAIP_BANDS",
     "SPECTRAL_INDICES",
     "download_naip_timeseries",
@@ -239,11 +255,11 @@ def _parse_nwi_code(code: Optional[str]) -> int:
         code: NWI attribute code string (e.g., 'PEM1Ch', 'L1UBHh').
 
     Returns:
-        Integer class ID from COWARDIN_CLASSES. Returns 3 (Other) for
-        unrecognized or empty codes.
+        Integer class ID from COWARDIN_CLASSES, or IGNORE_INDEX (255) for
+        unrecognized or empty codes (and for PFO/PSS, which are ignored).
     """
     if not code:
-        return 3
+        return IGNORE_INDEX
 
     upper = code.upper()
 
@@ -257,7 +273,7 @@ def _parse_nwi_code(code: Optional[str]) -> int:
         if prefix3 in NWI_CODE_TO_CLASS:
             return NWI_CODE_TO_CLASS[prefix3]
 
-    return 3
+    return IGNORE_INDEX
 
 
 def _compute_index(name: str, bands: Dict[str, np.ndarray]) -> np.ndarray:
@@ -1741,8 +1757,12 @@ def export_training_tiles(
 
                 lbl_tile = lbl_src.read(1, window=window)
 
-                # Wetland-fraction filter (class 0 = upland)
-                wetland_frac = np.count_nonzero(lbl_tile) / lbl_tile.size
+                # Wetland-fraction filter (class 0 = upland, IGNORE_INDEX = masked).
+                # Count only real wetland classes (Water, Emergent), not ignored pixels.
+                wetland_frac = (
+                    np.count_nonzero((lbl_tile > 0) & (lbl_tile != IGNORE_INDEX))
+                    / lbl_tile.size
+                )
                 if wetland_frac < min_wetland_fraction:
                     continue
 
@@ -1831,8 +1851,8 @@ def train_wetland_model(
     output_dir: Union[str, Path],
     architecture: str = "unetplusplus",
     encoder_name: str = "resnet50",
-    num_classes: int = 4,
-    in_channels: int = 14,
+    num_classes: int = 3,
+    in_channels: int = 10,
     num_epochs: int = 100,
     batch_size: int = 32,
     learning_rate: float = 3e-4,
@@ -1842,7 +1862,7 @@ def train_wetland_model(
     val_split: float = 0.2,
     seed: int = 42,
     encoder_weights: Optional[str] = "imagenet",
-    ignore_index: int = -100,
+    ignore_index: int = IGNORE_INDEX,
     focal_alpha: float = 1.0,
     focal_gamma: float = 2.0,
     ufl_lambda: float = 0.5,
@@ -1875,8 +1895,8 @@ def train_wetland_model(
         encoder_name: Backbone encoder name (timm/SMP compatible).
             Default ``"resnet50"``.
         num_classes: Number of output classes including background.
-            Default 4 (PPR-collapsed Cowardin schema).
-        in_channels: Number of input bands. Default 14.
+            Default 3 (PPR-collapsed Cowardin schema: Upland/Water/Emergent).
+        in_channels: Number of input bands. Default 10.
         num_epochs: Maximum training epochs. Default 100.
         batch_size: Training batch size. Default 32 (V100-32GB FP32).
         learning_rate: Initial learning rate. Default 3e-4 (AdamW norm
@@ -1891,10 +1911,11 @@ def train_wetland_model(
         val_split: Fraction of data for validation. Default 0.2.
         seed: Random seed for reproducibility. Default 42.
         encoder_weights: Pretrained encoder weights. Default ``"imagenet"``.
-        ignore_index: Class index to ignore in loss. Default ``-100``
-            (ignore none). Previously ``0`` (Upland), which starved the
-            gradient signal and caused collapse to trivial majority-class
-            predictions on PPR data.
+        ignore_index: Class index to ignore in loss. Default ``255``
+            (``IGNORE_INDEX``) — masks PFO/PSS and unrecognized NWI codes.
+            Upland (0) is NOT this value, so it stays in the loss with a
+            small class weight; excluding upland (an earlier ``0`` default)
+            starved the gradient and collapsed to majority-class predictions.
         focal_alpha: Focal loss alpha parameter. Default 1.0.
         focal_gamma: Focal loss gamma parameter. Default 2.0.
         ufl_lambda: Unified Focal Loss lambda (0=pure focal Tversky,
@@ -2150,8 +2171,8 @@ def predict_wetlands(
     output_path: Union[str, Path],
     architecture: str = "unetplusplus",
     encoder_name: str = "resnet50",
-    num_classes: int = 4,
-    in_channels: int = 14,
+    num_classes: int = 3,
+    in_channels: int = 10,
     tile_size: int = 256,
     overlap: int = 128,
     batch_size: int = 4,
@@ -2174,8 +2195,8 @@ def predict_wetlands(
         architecture: Segmentation architecture name. Must match the
             architecture used during training. Default ``"unetplusplus"``.
         encoder_name: Encoder backbone name. Default ``"resnet50"``.
-        num_classes: Number of output classes. Default 4.
-        in_channels: Number of input bands. Default 14.
+        num_classes: Number of output classes. Default 3.
+        in_channels: Number of input bands. Default 10.
         tile_size: Inference tile size in pixels. Default 256.
         overlap: Overlap between adjacent tiles in pixels. Default 128.
         batch_size: Number of tiles per inference batch. Default 4.

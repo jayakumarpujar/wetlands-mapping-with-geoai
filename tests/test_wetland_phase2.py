@@ -174,12 +174,16 @@ class TestReclassifyNWIIntegration(unittest.TestCase):
 
         out = os.path.join(self.tmpdir, "nwi_reclassified.tif")
         reclassify_nwi(self.nwi_path, self.template_path, out)
+        from research_paper.wetland import IGNORE_INDEX
+
         with rasterio.open(out) as src:
             data = src.read(1)
-            unique = set(np.unique(data))
-            # Should contain water (1), emergent (2), forested (3)
-            # and possibly 0 (upland/background) for lower-right
-            self.assertTrue({1, 2, 3}.issubset(unique) or {1, 2, 3} == unique)
+            unique = set(int(v) for v in np.unique(data))
+            # Water (1) and emergent (2) are real classes; forested/scrub
+            # (PFO/PSS) are now masked as IGNORE_INDEX (255); 0 = background.
+            self.assertTrue({1, 2}.issubset(unique))
+            self.assertIn(IGNORE_INDEX, unique)
+            self.assertTrue(unique.issubset({0, 1, 2, IGNORE_INDEX}))
 
     def test_output_dtype_is_uint8(self):
         import rasterio
@@ -194,15 +198,20 @@ class TestReclassifyNWIIntegration(unittest.TestCase):
     def test_class_values_in_valid_range(self):
         import rasterio
 
-        from research_paper.wetland import COWARDIN_CLASSES, reclassify_nwi
+        from research_paper.wetland import (
+            COWARDIN_CLASSES,
+            IGNORE_INDEX,
+            reclassify_nwi,
+        )
 
         out = os.path.join(self.tmpdir, "nwi_reclassified.tif")
         reclassify_nwi(self.nwi_path, self.template_path, out)
         with rasterio.open(out) as src:
             data = src.read(1)
-            valid_ids = set(COWARDIN_CLASSES.keys())
+            # Valid raster values: the real classes plus the IGNORE_INDEX sentinel.
+            valid_ids = set(COWARDIN_CLASSES.keys()) | {IGNORE_INDEX}
             for val in np.unique(data):
-                self.assertIn(int(val), valid_ids, f"Class {val} not in COWARDIN_CLASSES")
+                self.assertIn(int(val), valid_ids, f"Class {val} not valid")
 
 
 # ---------------------------------------------------------------------------
@@ -385,44 +394,83 @@ class TestGenerateWeakLabelsIntegration(unittest.TestCase):
         self.assertEqual(result, out)
         self.assertTrue(os.path.exists(out))
 
-    def test_depression_filter_removes_non_depression_pixels(self):
+    def _write_like(self, path, array, dtype, nodata=None):
+        """Write a single-band raster matching the fixture grid."""
+        import rasterio
+
+        with rasterio.open(self.nwi_path) as ref:
+            profile = ref.profile
+        profile.update(dtype=dtype, count=1)
+        if nodata is not None:
+            profile.update(nodata=nodata)
+        with rasterio.open(path, "w", **profile) as dst:
+            dst.write(array.astype(dtype), 1)
+
+    def test_depression_filter_drops_low_overlap_component(self):
+        """Object-level filter: a wetland component without enough depression
+        overlap is dropped entirely; one fully inside the depression is kept."""
         import rasterio
 
         from research_paper.wetland import generate_weak_labels
 
-        out = os.path.join(self.tmpdir, "labels.tif")
+        # Region A: rows 8-23, cols 8-23 — fully inside the central depression.
+        # Region B: rows 4-7, cols 0-7 — stable but entirely OUTSIDE depression.
+        nwi = np.zeros((32, 32), dtype=np.uint8)
+        nwi[8:24, 8:24] = 2  # component A (kept)
+        nwi[4:8, 0:8] = 2    # component B (dropped — no depression overlap)
+        nwi_path = os.path.join(self.tmpdir, "nwi_dep.tif")
+        self._write_like(nwi_path, nwi, "uint8")
+
+        out = os.path.join(self.tmpdir, "labels_dep.tif")
         generate_weak_labels(
-            nwi_raster_path=self.nwi_path,
+            nwi_raster_path=nwi_path,
             depression_path=self.dep_path,
             ndvi_paths=[self.ndvi1_path, self.ndvi2_path],
             ndwi_paths=[self.ndwi1_path, self.ndwi2_path],
             output_path=out,
             depression_threshold=0.5,
+            min_component_fraction=0.5,
         )
         with rasterio.open(out) as src:
             data = src.read(1)
-            # Corners (outside depression area 8:24,8:24) should be 0 (no label)
+            self.assertEqual(data[16, 16], 2, "in-depression component should be kept")
+            self.assertEqual(data[5, 2], 0, "out-of-depression component should be dropped")
             self.assertEqual(data[0, 0], 0)
-            self.assertEqual(data[-1, -1], 0)
 
-    def test_stability_filter_removes_unstable_pixels(self):
+    def test_stability_filter_drops_unstable_component(self):
+        """Object-level filter: a temporally unstable wetland component is
+        dropped; a stable one (same class, disconnected) is kept."""
         import rasterio
 
         from research_paper.wetland import generate_weak_labels
 
-        out = os.path.join(self.tmpdir, "labels.tif")
+        # Depression everywhere so stability is the only discriminator.
+        dep = np.full((32, 32), 2.0, dtype=np.float32)
+        dep_path = os.path.join(self.tmpdir, "dep_full.tif")
+        self._write_like(dep_path, dep, "float32", nodata=-9999.0)
+
+        # Region A: rows 8-23 (stable) — kept. Region B: rows 0-3 (unstable
+        # in ndvi2/ndwi2) — dropped. Disconnected → two components.
+        nwi = np.zeros((32, 32), dtype=np.uint8)
+        nwi[8:24, 8:24] = 2  # component A (stable, kept)
+        nwi[0:4, 8:24] = 2   # component B (unstable, dropped)
+        nwi_path = os.path.join(self.tmpdir, "nwi_stab.tif")
+        self._write_like(nwi_path, nwi, "uint8")
+
+        out = os.path.join(self.tmpdir, "labels_stab.tif")
         generate_weak_labels(
-            nwi_raster_path=self.nwi_path,
-            depression_path=self.dep_path,
+            nwi_raster_path=nwi_path,
+            depression_path=dep_path,
             ndvi_paths=[self.ndvi1_path, self.ndvi2_path],
             ndwi_paths=[self.ndwi1_path, self.ndwi2_path],
             output_path=out,
             stability_threshold=0.05,
+            min_component_fraction=0.5,
         )
         with rasterio.open(out) as src:
             data = src.read(1)
-            # Top rows (0-3) should be filtered out (unstable)
-            self.assertTrue(np.all(data[:4, :] == 0))
+            self.assertEqual(data[16, 16], 2, "stable component should be kept")
+            self.assertTrue(np.all(data[:4, :] == 0), "unstable top rows should be dropped")
 
     def test_output_preserves_grid(self):
         import rasterio

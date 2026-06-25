@@ -168,7 +168,7 @@ predict_wetlands(
     architecture="unetplusplus",
     encoder_name="resnet50",
     in_channels=10,
-    num_classes=4,
+    num_classes=3,
 )
 
 metrics = compare_with_nwi(
@@ -217,7 +217,8 @@ Composite writer at [run_experiment.py:289-360](../run_experiment.py#L289-L360) 
 
 ## Pre-flight Troubleshooting
 
-**Symptom**: Val IoU plateaus at ~0.197 (num_classes=4 → 1/5 ≈ 0.2 trivial baseline)
+**Symptom**: Val mean IoU plateaus at a low value (num_classes=3 → a collapse-to-upland
+prediction caps mean IoU near upland_IoU/3, the trivial baseline)
 - Check normalization applied: inspect composite band stats, all should be in [0,1]
 - Check NAIP coverage: `gdalinfo` on composite, verify band 1 nonzero across extent
 - Check tile count: expect 3000-8000 post-filter with `--tile-stride 128`

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -24,6 +25,13 @@ import torch
 import segmentation_models_pytorch as smp
 from torch.utils.data import DataLoader, Dataset
 import rasterio
+
+# Single source of truth for the class schema (kept in sync with wetland.py).
+try:
+    from research_paper.wetland import COWARDIN_CLASSES, IGNORE_INDEX
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from wetland import COWARDIN_CLASSES, IGNORE_INDEX
 
 
 class TileDataset(Dataset):
@@ -79,9 +87,9 @@ def evaluate(
     architecture: str = "unetplusplus",
     encoder_name: str = "resnet50",
     in_channels: int = 10,
-    num_classes: int = 4,
+    num_classes: int = 3,
     batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: int = 1,
 ) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}", flush=True)
@@ -122,7 +130,9 @@ def evaluate(
             logits = model(images)
             preds = logits.argmax(dim=1).cpu()
 
-            valid = labels >= 0
+            # Drop ignored pixels: negatives, the IGNORE_INDEX (255) sentinel,
+            # and anything else outside [0, num_classes).
+            valid = (labels >= 0) & (labels != IGNORE_INDEX) & (labels < num_classes)
             if not valid.any():
                 continue
 
@@ -147,7 +157,7 @@ def evaluate(
     total_pixels = conf_np.sum()
     overall_acc = float(np.trace(conf_np)) / float(total_pixels) if total_pixels > 0 else 0.0
 
-    class_names = {0: "upland", 1: "emergent", 2: "forested", 3: "pond"}
+    class_names = COWARDIN_CLASSES
     per_class = {}
     ious = []
 
@@ -207,9 +217,9 @@ if __name__ == "__main__":
     parser.add_argument("--architecture", default="unetplusplus")
     parser.add_argument("--encoder-name", default="resnet50")
     parser.add_argument("--in-channels", type=int, default=10)
-    parser.add_argument("--num-classes", type=int, default=4)
+    parser.add_argument("--num-classes", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=1)
     args = parser.parse_args()
 
     evaluate(

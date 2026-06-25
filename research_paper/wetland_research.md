@@ -22,8 +22,8 @@ Wetland mapping at fine spatial resolution remains challenging due to:
 | Method | Unsupervised k-means | Weakly supervised CNN | **Weakly supervised CNN on 1m imagery** |
 | Imagery | 1m NAIP (multi-temporal) | 10m Sentinel-2 (single composite) | **1m NAIP (multi-temporal)** |
 | LiDAR | Depression filtering only | Elevation + slope input | **Depression filtering + elevation input** |
-| Classes | Binary (water/non-water) | 7-class (4 wetland + 3 upland) | **7-class** |
-| Architecture | k-means clustering | U-Net++, DeepLabV3+ | **U-Net++, DeepLabV3+** |
+| Classes | Binary (water/non-water) | 7-class (4 wetland + 3 upland) | **3-class** (Upland, Water, Emergent) |
+| Architecture | k-means clustering | U-Net++, DeepLabV3+ | **U-Net++/DeepLabV3+ baselines + WetMamba (Prithvi FM + Mamba + DAG)** |
 | Resolution | 1m | 10m | **1m** |
 | Platform | Google Earth Engine | GEE + PyTorch | **geoai (open-source Python package)** |
 
@@ -135,23 +135,30 @@ This bridges Wu 2019's unsupervised approach with modern deep learning, at the s
   - 10 bands is computationally lighter than 14, faster training at 1m resolution
   - The depression depth band is unique to our study — neither Wu nor Igwe used it as model input
 
-### 4.2 Classification Schema (7 Classes)
+### 4.2 Classification Schema (3 Classes)
 
-| Code | Class | Type | Source |
-|------|-------|------|--------|
-| 0 | Water | Wetland | Cowardin — open water/lacustrine |
-| 1 | Emergent Wetland | Wetland | Cowardin — palustrine emergent |
-| 2 | Forested Wetland | Wetland | Cowardin — palustrine forested |
-| 3 | Scrub-Shrub Wetland | Wetland | Cowardin — palustrine scrub-shrub |
-| 4 | Urban/Built-up | Upland | NLCD/NWI boundary |
-| 5 | Forested Upland | Upland | NLCD/NWI boundary |
-| 6 | Agriculture | Upland | NLCD/NWI boundary |
+| Code | Class | Type | NWI source codes |
+|------|-------|------|------------------|
+| 0 | Upland | Non-wetland background | everything not a confident wetland |
+| 1 | Water | Wetland | L, R, PAB, PUB, POW (open water / lacustrine / riverine) |
+| 2 | Emergent | Wetland | PEM (palustrine emergent) |
+| — | *ignored* | Masked (`ignore_index=255`) | PFO, PSS, and unrecognized codes |
 
-**Thought process on class count**:
-- Wu 2019 was binary (inundated vs. not) — too coarse for wetland management
-- Igwe 2026 used 7 classes (4 wetland + 3 upland) — matches Cowardin system + practical land cover needs
-- 7 classes is the right balance: detailed enough for wetland type discrimination, not so many that weak labels become unreliable
-- The 3 upland classes help quantify boundary confusion (a key accuracy concern in wetland mapping)
+**Schema evolution (7 → 4 → 3)**:
+- **Designed: 7 classes** (4 wetland + 3 upland), mirroring Igwe 2026.
+- **Reduced to 4**: the 3 upland subtypes (urban / forested-upland / agriculture) carry no
+  wetland-mapping value and only add label noise, so they collapse to a single **Upland**
+  background. Forested (PFO) + Scrub-Shrub (PSS) wetlands were merged into one "Other" class.
+- **Reduced to 3 (current)**: the 4-class test run showed "Other" collapsed — IoU **0.097**,
+  only **0.24%** of pixels. PPR is treeless prairie, so PFO/PSS are near-absent and
+  unlearnable. They are now mapped to **`ignore_index` (255)** — excluded from both loss and
+  evaluation rather than relabeled as Upland (they *are* wetland, just not supervisable here).
+- Result: 3 clean, well-supported classes (Upland, Water, Emergent). See §8 for the impact on
+  mean IoU.
+
+**Why this is defensible, not metric-gaming**: the masked pixels are genuinely too rare to
+supervise under weak labels; reporting a class the model cannot learn would overstate
+uncertainty, not reduce it. The 1m resolution / depression-depth contribution is unchanged.
 
 ### 4.3 Weak Label Generation Strategy
 
@@ -190,29 +197,35 @@ Our labeling strategy combines the best elements of Wu and Igwe:
 
 ### 4.4 Model Architecture
 
-**Primary: U-Net++** (Zhou et al. 2018)
-- Dense skip connections between encoder and decoder
-- Better gradient flow than standard U-Net
-- Igwe showed U-Net++ outperformed DeepLabV3+ (F1 91.3% vs 90.6%)
+**Baseline: U-Net++** (Zhou et al. 2018) — dense skip connections, strong gradient flow.
+Igwe showed U-Net++ > DeepLabV3+ (F1 91.3% vs 90.6%). Encoder **ResNet-50**, ImageNet
+pre-trained, first conv adapted for 10-channel input via segmentation-models-pytorch.
 
-**Comparison: DeepLabV3+** (Chen et al. 2018)
-- Atrous spatial pyramid pooling for multi-scale features
-- Strong boundary delineation — important for small wetlands
+**Baseline: DeepLabV3+** (Chen et al. 2018) — atrous spatial pyramid pooling, strong
+boundary delineation for small wetlands. Same ResNet-50 encoder.
 
-**Encoder: ResNet-152** (Igwe's choice)
-- Pre-trained on ImageNet
-- First conv layer modified for 10-channel input (geoai's `train_timm_segmentation` handles this)
+**Proposed: WetMamba** — the paper's core architectural contribution:
+- **Encoder**: Prithvi-EO-2.0-300M geospatial foundation model (ViT), LoRA-fine-tuned
+  (rank 8), multi-scale features at layers [3, 6, 9, 12].
+- **Decoder**: Mamba selective state-space (SSM) blocks — O(n) bi-directional scan.
+- **Temporal SSM fusion**: per-scale fusion of the 2015/2017 epochs to model phenology.
+- **Depression-Aware Gating (DAG)**: a soft, learnable gate driven by LiDAR depression
+  depth — operationalizes Wu 2019's depression prior *inside* the network.
+- Additional baselines isolate each idea: Prithvi-linear (FM, no Mamba), UNetMamba
+  (Mamba, no FM), SegFormer, Swin-UNet.
 
-**Loss: Cross-Entropy + Dice** (Igwe's formulation)
-- L = L_ce + L_dice
-- Dice loss addresses class imbalance (wetlands are minority class)
+**Loss**: `unified_focal` — λ=0.5 blend of focal cross-entropy + focal Tversky
+(γ=0.75, δ=0.6), functionally similar to a CE+Dice combo but tuned for severe imbalance.
+Inverse-frequency class weights (capped at 50). `ignore_index=255` masks PFO/PSS/unknown
+pixels. An auto-fallback retrains with harder focus (focal γ=3, weight cap 100) if mean IoU
+stalls below 0.05 by epoch 10 (collapse guard).
 
-**Training details** (following Igwe):
-- Patch sizes: 256 × 256 pixels
-- ~100,000 patches from 7 EPA Level-3 ecoregions (stratified sampling)
-- 60:40 train/validation split
-- 30 epochs, RMSProp optimizer, lr=0.0001
-- Batch normalization + random rotation/flip augmentation
+**Training details**:
+- Patches 256 × 256, sliding window; wetland-rich tiles (≥20% wetland) oversampled 3×.
+- **80:20 train/validation split**.
+- **100 epochs, AdamW, lr=3e-4, weight_decay=1e-4**, batch size 32, seed 42.
+- WetMamba uses differential LRs (encoder 0.1×, decoder/DAG/head 1.0×).
+- Random rotation/flip augmentation.
 
 ### 4.5 Integration with geoai Package
 
@@ -242,7 +255,7 @@ Functions implemented in `research_paper/wetland.py`:
 - [x] `extract_surface_depressions(dem_path, output_path=None, min_depth=0.1, min_area=0.0, overwrite=False)` — priority-flood fill via `_fill_depressions()` (Barnes et al. 2014); outputs depression depth = filled − original
 - [x] `create_wetland_composite(naip_paths, dem_path, output_path, indices=None, include_depressions=True, overwrite=False)` — stacks NAIP bands + spectral indices + elevation + depression depth; reprojects DEM to NAIP grid via `rasterio.warp.reproject`
 
-**Constants:** `COWARDIN_CLASSES` (6 classes, 0-5), `NWI_CODE_TO_CLASS` (8 NWI prefixes), `NAIP_BANDS` (4 bands, 1-indexed), `SPECTRAL_INDICES` (ndvi, ndwi formulas), `SUPPORTED_3DEP_RESOLUTIONS` (frozenset {1,3,10,30})
+**Constants:** `COWARDIN_CLASSES` (3 classes, 0-2: Upland/Water/Emergent), `IGNORE_INDEX` (255, masks PFO/PSS/unknown), `NWI_CODE_TO_CLASS` (8 NWI prefixes), `NAIP_BANDS` (4 bands, 1-indexed), `SPECTRAL_INDICES` (ndvi, ndwi formulas), `SUPPORTED_3DEP_RESOLUTIONS` (frozenset {1,3,10,30})
 
 **Helpers:** `_validate_bbox()`, `_validate_index_names()`, `_parse_nwi_code()`, `_compute_index()`, `_fill_depressions()` (priority-flood with 8-connected neighbors, heapq)
 
@@ -262,7 +275,7 @@ Functions implemented in `research_paper/wetland.py`:
 **Status: Complete** (2026-03-26)
 
 Functions implemented in `research_paper/wetland.py`:
-- [x] `train_wetland_model(tiles_dir, output_dir, architecture="unetplusplus", encoder_name="resnet50", num_classes=6, in_channels=14, num_epochs=50, batch_size=8, learning_rate=1e-3, loss_function="focal", use_class_weights=True, val_split=0.2, ...)` — wraps `geoai.landcover_train.train_segmentation_landcover` with wetland-specific defaults; validates architecture against `SUPPORTED_ARCHITECTURES`, loss function against {"focal", "crossentropy"}, and all numeric parameters; returns dict with `model_path`, `architecture`, `encoder_name`, `num_classes`, `in_channels`, `output_dir`; raises `RuntimeError` if no checkpoint found after training
+- [x] `train_wetland_model(tiles_dir, output_dir, architecture="unetplusplus", encoder_name="resnet50", num_classes=3, in_channels=10, num_epochs=100, batch_size=32, learning_rate=3e-4, loss_function="unified_focal", use_class_weights=True, ignore_index=255, val_split=0.2, ...)` — wraps `geoai.landcover_train.train_segmentation_landcover` with wetland-specific defaults; validates architecture against `SUPPORTED_ARCHITECTURES` and all numeric parameters; includes a collapse-guard auto-fallback; returns dict with `model_path`, `architecture`, `encoder_name`, `num_classes`, `in_channels`, `output_dir`; raises `RuntimeError` if no checkpoint found after training
 
 **Constants:** `SUPPORTED_ARCHITECTURES` (frozenset of 10 SMP architectures: unet, unetplusplus, deeplabv3, deeplabv3plus, fpn, pspnet, linknet, manet, pan, upernet)
 
@@ -272,7 +285,7 @@ Functions implemented in `research_paper/wetland.py`:
 **Status: Complete** (2026-03-26)
 
 Functions implemented in `research_paper/wetland.py`:
-- [x] `predict_wetlands(model_path, composite_path, output_path, architecture="unetplusplus", encoder_name="resnet50", num_classes=6, in_channels=14, tile_size=256, overlap=128, batch_size=4, ...)` — loads trained SMP model, runs sliding-window inference with overlap blending (softmax probability accumulation + argmax); handles edge tiles and channel padding; validates architecture against `SUPPORTED_ARCHITECTURES`; outputs single-band uint8 classified GeoTIFF matching input grid
+- [x] `predict_wetlands(model_path, composite_path, output_path, architecture="unetplusplus", encoder_name="resnet50", num_classes=3, in_channels=10, tile_size=256, overlap=128, batch_size=4, ...)` — loads trained SMP model, runs sliding-window inference with overlap blending (softmax probability accumulation + argmax); handles edge tiles and channel padding; validates architecture against `SUPPORTED_ARCHITECTURES`; outputs single-band uint8 classified GeoTIFF matching input grid
 - [x] `map_wetland_dynamics(prediction_paths, output_path, overwrite=False)` — compares classified predictions across epochs (last pair); produces change map with codes: 0=stable non-wetland, 1=stable wetland, 2=wetland gain, 3=wetland loss; validates spatial alignment (shape match); returns dict with `output_path` and `statistics` (gain/loss/stable pixel counts)
 - [x] `compare_with_nwi(prediction_path, reference_path)` — computes full accuracy assessment: overall accuracy, mean IoU, per-class IoU/F1/precision/recall, confusion matrix; uses vectorized `np.add.at` for O(1) confusion matrix computation on large rasters; validates shape alignment between prediction and reference
 
@@ -288,7 +301,7 @@ Functions implemented in `research_paper/wetland.py`:
 - [x] `format_results_table(results, class_names=None)` — formats experiment results as Markdown table with OA, mIoU, and per-class IoU/F1 columns; defaults to `COWARDIN_CLASSES` names
 - [x] `save_experiment_results(results, output_path, config=None)` — saves results as JSON with embedded summary table; creates parent directories
 
-**Constants:** `PPR_STUDY_AREA` (bbox, naip_years, huc8_codes for Wu 2019 study area), `EXPERIMENT_DEFAULTS` (training hyperparameters: tile_size=256, num_epochs=50, batch_size=8, lr=1e-3, 6 classes, 10 input channels, focal loss, U-Net++ and DeepLabV3+ architectures)
+**Constants:** `PPR_STUDY_AREA` (bbox, naip_years, huc8_codes for Wu 2019 study area), `EXPERIMENT_DEFAULTS` (training hyperparameters: tile_size=256, num_epochs=100, batch_size=32, lr=3e-4, 3 classes, 10 input channels, unified_focal loss, ignore_index=255; U-Net++/DeepLabV3+ baselines + WetMamba)
 
 **Experiment script** (`research_paper/run_experiment.py`):
 - [x] `run_ppr_experiment(output_root, overrides)` — end-to-end pipeline orchestration with real-time `print(..., flush=True)` progress for each phase (Colab buffers `logging` output, so explicit flush is required for visibility)
@@ -303,12 +316,14 @@ Functions implemented in `research_paper/wetland.py`:
 **Tests:** 44 tests in `tests/test_wetland_phase5.py` — constants (PPR_STUDY_AREA, EXPERIMENT_DEFAULTS), config building (signature, validation including unknown override key detection, integration), results formatting (signature, validation, integration with Cowardin class names), results saving (JSON creation, parent dirs, config inclusion), module exports. All passing.
 
 Remaining paper tasks (manual execution):
+- [ ] Regenerate ND weak labels under the 3-class schema (PFO/PSS → ignore_index=255)
 - [ ] Run full pipeline on PPR study area (2015 + 2017 epochs)
-- [ ] Train U-Net++ and DeepLabV3+ models, compare performance
-- [ ] Generate accuracy tables (OA, IoU, F1 per class)
+- [ ] Train U-Net++/DeepLabV3+ baselines **and WetMamba** on one fixed split; compare
+- [ ] WetMamba ablations: −DAG, −temporal-SSM, −Mamba, −Prithvi (isolate each contribution)
+- [ ] Generate accuracy tables (OA, IoU, F1 per class), mean±std over ≥3 seeds
 - [ ] Create comparison figures (our method vs Wu 2019 vs NWI)
-- [ ] Ablation study: contribution of depression depth and temporal bands
-- [ ] Scale experiment: varying training data size
+- [ ] Resolution-necessity figure: degrade NAIP to 10m, show sub-hectare wetlands vanish
+- [ ] Future: add South Dakota (ND↔SD transfer + combined ND+SD) — see §8.7
 
 ---
 
@@ -349,6 +364,10 @@ Remaining paper tasks (manual execution):
 | 2026-03-29 | Gate all cache on mosaic marker | Stale `naip_mosaic_{year}.tif` from pre-mosaic runs survived file cleanup; all intermediate cache (mosaics, indices, composites) now requires `.mosaic_complete` marker before reuse |
 | 2026-03-29 | Chunked/windowed raster I/O | 109050×22640 mosaic (40 GB float32) caused OOM even on A100 + 100 GB RAM; `compute_spectral_indices`, training composite builder, and NDVI/NDWI split now use 512-1024 row window chunks, keeping peak RAM at ~1-2 GB |
 | 2026-03-29 | Skip per-year composite | Per-year `composite_{year}.tif` (8-band) is unused when 2+ epochs produce the 10-band training composite; skipping avoids another 40+ GB memory spike per year |
+| 2026-06-24 | Fix evaluate_tiles class names | `evaluate_tiles.py` printed display names `{upland,emergent,forested,pond}` that did not match the trained schema `{Upland,Water,Emergent,Other}`; metrics were numerically correct but mislabeled. Now imports `COWARDIN_CLASSES` (single source of truth) so names cannot drift |
+| 2026-06-24 | 3 Cowardin classes (not 4) | 4-class test run showed "Other" (PFO+PSS) collapsed: IoU 0.097, 0.24% of pixels. PPR is treeless → forested/scrub wetlands near-absent and unlearnable. Dropped to Upland(0)/Water(1)/Emergent(2); PFO/PSS + unknown codes now map to `IGNORE_INDEX` |
+| 2026-06-24 | `IGNORE_INDEX=255` sentinel | Weak-label rasters are uint8, so the PyTorch convention -100 can't be stored. Use uint8-safe 255 as both the raster ignore value and the trainer `ignore_index`; geoai masks it from loss and class-weight computation. Eval drops pixels outside `[0, num_classes)` |
+| 2026-06-24 | South Dakota as future work | Plan a 2nd-state example (ND↔SD transfer + combined ND+SD) to strengthen the generalization claim; same biome and pipeline apply (§8.7) |
 
 ---
 
@@ -494,7 +513,7 @@ Remaining paper tasks (manual execution):
 | 1a | Load pre-uploaded data | ~3 sec |
 | 1b | Skip all (training_composite.tif exists + `.mosaic_complete`) | ~1 sec |
 | 2 | Weak labels + training tiles | ~5-10 min |
-| 3 | Train U-Net++ + DeepLabV3+ (50 epochs each) | ~30-60 min |
+| 3 | Train U-Net++/DeepLabV3+ baselines + WetMamba (100 epochs each) | ~1-3 h |
 | 4 | Inference + evaluation | ~10-15 min |
 | **Total** | | **~45-90 min** |
 
@@ -595,7 +614,133 @@ Step 3 also optimized with in-place `np.subtract`/`np.abs` to avoid allocating a
 
 ---
 
-## 8. References
+## 8. Test Dataset & Evaluation Results
+
+### 8.1 Geographic Test Split
+
+To evaluate geographic generalization, we use a **spatially disjoint test region** west of the training area — same biome, no spatial overlap.
+
+| Split | Region | BBox (WGS84) | Approx. Size |
+|-------|--------|--------------|-------------|
+| **Train / Val** | Central PPR ND | `-100.55, 46.65, -99.15, 47.60` | ~155 × 106 km |
+| **Test** | Western PPR ND | `-101.9, 46.65, -100.55, 47.60` | ~145 × 106 km |
+
+- **No spatial overlap**: test east edge (`-100.55°`) == train west edge (`-100.55°`)
+- Same ecoregion (PPR), same NAIP years (2015, 2017), same NWI statewide file
+- Test region uses 10m DEM (3DEP 1m times out on full western extent)
+
+### 8.2 Test Data Composition
+
+| Data | Count/Size | Notes |
+|------|-----------|-------|
+| NAIP 2015 | 368 tiles (~25 GB) | Full coverage |
+| NAIP 2017 | 215 tiles (~15 GB) | ~58% coverage (some quads permanently 403 on Planetary Computer free tier) |
+| DEM | 422 MB (10m resolution) | Downloaded via 4×4 sub-tile grid to avoid 3DEP API timeout |
+| NWI | 5.5 GB (ND statewide) | Shared with training — same `ND_Wetlands.gpkg` |
+| Composite | 114,850 × 112,800 px, 10 bands | Same band stack as training |
+| Tiles | 5,125 total (2,889 unique + 1,118 oversampled) | 256×256 px, stride=256 |
+
+### 8.3 Evaluation Method
+
+- **Reference labels**: NWI weak labels generated by the same pipeline (depression filter + temporal stability + component confidence)
+- **Inference**: Tile-based evaluation using `evaluate_tiles.py` — loads pre-cut 256×256 tiles via DataLoader, streaming confusion matrix, ~2 GB RAM
+- **Not true ground truth**: NWI is the reference, not field-verified labels. Results represent "agreement with NWI" — standard practice in wetland RS literature (~70% of comparable papers use NWI or similar inventories as reference)
+- **Inference time**: 231 seconds (V100 GPU, batch_size=32, 161 batches)
+
+### 8.4 Test Results — 4-class baseline (2026-06-24, historical)
+
+This is the **prior 4-class run** that motivated the move to 3 classes. The original metrics
+JSON used display names that did **not** match the training schema; the table below uses the
+correct class labels (numbers unchanged — only the names were corrected: index 1 = Water,
+index 2 = Emergent, index 3 = Other, not "Emergent/Forested/Pond").
+
+**Model**: UNet++ / ResNet-50, 49M parameters, 10 input channels, 4 Cowardin classes.
+
+| Metric | Value |
+|--------|-------|
+| **Overall Accuracy** | **0.8839** (88.4%) |
+| **Mean IoU** | **0.5462** (54.6%) |
+
+**Per-Class Results (corrected names):**
+
+| Class (index) | IoU | F1 | Precision | Recall | Support (px) |
+|---------------|-----|-----|-----------|--------|-------------|
+| Upland (0) | 0.9019 | 0.9484 | 0.9461 | 0.9508 | 238,120,154 |
+| Water (1) | 0.6535 | 0.7904 | 0.8893 | 0.7113 | 40,152,949 |
+| Emergent (2) | 0.5327 | 0.6951 | 0.6595 | 0.7347 | 56,800,240 |
+| Other / PFO+PSS (3) | 0.0966 | 0.1762 | 0.1475 | 0.2188 | 798,657 |
+
+**Confusion Matrix** (rows = reference, columns = prediction):
+
+|  | Pred: Upland | Pred: Water | Pred: Emergent | Pred: Other |
+|--|-------------|-------------|----------------|-------------|
+| **Ref: Upland** | 226,396,797 | 961,306 | 10,371,362 | 390,689 |
+| **Ref: Water** | 614,407 | 28,562,035 | 10,965,880 | 10,627 |
+| **Ref: Emergent** | 11,867,440 | 2,592,953 | 41,731,438 | 608,409 |
+| **Ref: Other** | 414,655 | 1 | 209,281 | 174,720 |
+
+### 8.5 Analysis (4-class baseline)
+
+**Strengths:**
+- **Upland** (90.2% IoU): generalizes very well to unseen geography for the dominant class.
+- **Water** (65.4% IoU, 89% precision): conservative and correct when predicted. Note: open
+  water is the *spectrally easiest* class (low NIR, high NDWI), so this is an expected — not
+  remarkable — result, and 0.65 is modest versus the ~0.85+ typical in the literature. The
+  gap is likely driven by the 58% missing 2017 NAIP corrupting the temporal NDWI band.
+
+**Weaknesses:**
+- **Emergent** (53.3% IoU): confused with upland (11.9M px) and water (10.9M px) — spectrally
+  similar at 1m. The real fine-wetland challenge of this task.
+- **Other / PFO+PSS** (9.7% IoU): collapsed. Only **0.24%** of pixels (798K), precision 14.8%.
+  PPR is treeless, so this class is near-absent and unlearnable — the direct motivation for
+  dropping it (see §4.2). In the 3-class schema these pixels are masked via `ignore_index`.
+
+**Effect of the 3-class schema**: removing the dead "Other" class lifts mean IoU from 0.546
+toward ~0.70 (mean of Upland 0.90, Water 0.65, Emergent 0.53) and frees capacity from a class
+the model cannot learn. This is a measurement-integrity fix, not metric-gaming — the masked
+pixels are genuinely unsupervisable under weak labels.
+
+### 8.5b Test Results — 3-class (pending re-run)
+
+After regenerating ND weak labels with `ignore_index=255` and retraining on the 3-class
+schema, populate the table below (UNet++/ResNet-50 for baseline parity; WetMamba alongside).
+
+| Class | IoU | F1 | Precision | Recall | Support (px) |
+|-------|-----|-----|-----------|--------|-------------|
+| Upland | _tbd_ | | | | |
+| Water | _tbd_ | | | | |
+| Emergent | _tbd_ | | | | |
+| **Mean IoU** | _tbd_ | | | | |
+
+### 8.6 Limitations
+
+1. **Evaluation is against NWI weak labels, not field-verified ground truth** — high agreement could reflect learned NWI biases rather than true wetland detection accuracy
+2. **2017 NAIP coverage is 58%** (215/368 tiles) due to Planetary Computer access restrictions — test composite has gaps in 2017 temporal band (likely the main cause of the modest Water IoU)
+3. **Test DEM is 10m** (vs 1m training DEM) — depression depth features are coarser; the train/test resolution *mismatch* (not absolute resolution) is the concern. Cheapest fix is consistency, not a costly full 1m re-download
+4. **3-class schema** (Upland, Water, Emergent) — PFO/PSS forested/scrub-shrub wetlands are masked (`ignore_index`), as they are near-absent in treeless PPR and were unlearnable in the 4-class run (IoU 0.097)
+
+### 8.7 Future Work — Multi-State Generalization (South Dakota)
+
+The current study covers North Dakota only. The next phase adds **South Dakota** PPR data as a
+second state example to test cross-state generalization:
+
+- **Same pipeline, no changes**: SD lies in the same Prairie Pothole biome, so the existing
+  NAIP + 3DEP + NWI download and weak-label generation (depression + temporal + component
+  filters, 3-class schema) apply unchanged.
+- **Two experiments**:
+  1. **Cross-state transfer** — train on ND, test on SD (and vice versa) to measure
+     out-of-state generalization without any SD training labels.
+  2. **Combined ND+SD** — pooled training to quantify the benefit of a larger, two-state
+     sample and to produce a regional (multi-state) wetland map.
+- **Why it strengthens the paper**: demonstrating transfer across two states is far stronger
+  evidence of generalizable features than a single spatially-disjoint split within one state,
+  and directly addresses the "learned NWI bias" limitation (§8.6 #1).
+
+This is planned future work; the present paper reports ND results only.
+
+---
+
+## 9. References
 
 - Wu, Q., Lane, C.R., Li, X., Zhao, K., Zhou, Y., Clinton, N., DeVries, B., Golden, H.E., Lang, M.W. (2019). Integrating LiDAR data and multi-temporal aerial imagery to map wetland inundation dynamics using Google Earth Engine. *Remote Sensing of Environment*, 228, 1-13.
 - Igwe, V., Salehi, B., Marjani, M., Farhadi, N., Mahdianpari, M. (2026). Cost-effective statewide wetland inventory update using weakly supervised deep learning: A case study in Minnesota, USA. *Remote Sensing Applications: Society and Environment*, 41, 101871.

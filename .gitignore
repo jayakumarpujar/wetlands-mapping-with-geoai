@@ -34,6 +34,15 @@ env/
 # Experiment outputs
 ppr_experiment/
 experiment_output/
+cache/
+
+# Model weights (large binaries)
+*.pth
+*.ckpt
+*.pt
+
+# Generated metrics (regenerated per run)
+test_metrics.json
 
 # OS
 .DS_Store
