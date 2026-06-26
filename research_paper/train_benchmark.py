@@ -75,12 +75,13 @@ class TrainConfig:
 
     model_name: str = "wetmamba"
     ablation: Optional[str] = None
-    num_classes: int = 4
+    num_classes: int = 3
     input_channels: int = 7
     tile_size: int = 256
     batch_size: int = 8
     epochs: int = 100
     lr: float = 1e-4
+    allow_proxy: bool = False
     weight_decay: float = 1e-4
     scheduler: str = "cosine"
     warmup_epochs: int = 5
@@ -479,6 +480,7 @@ def train(config: TrainConfig) -> Dict[str, Any]:
         config.model_name,
         num_classes=config.num_classes,
         input_channels=config.input_channels,
+        allow_proxy=config.allow_proxy,
         **model_kwargs,
     )
     model = model.to(config.device)
@@ -659,6 +661,13 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num-workers", type=int, default=4)
 
+    # Safety
+    parser.add_argument(
+        "--allow-proxy", action="store_true",
+        help="Allow CNN proxy fallback when FM weights unavailable. "
+             "Off by default so benchmarks fail loudly on missing deps.",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -677,6 +686,7 @@ def main() -> None:
         wandb_project=args.wandb_project,
         device=args.device,
         num_workers=args.num_workers,
+        allow_proxy=args.allow_proxy,
     )
 
     if args.model == "all":

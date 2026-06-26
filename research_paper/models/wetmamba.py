@@ -7,7 +7,7 @@ Main architecture combining:
     4. Multi-Temporal SSM fusion — wetland phenology modeling
 
 Input: Multi-epoch NAIP+LiDAR composites (10 bands per epoch × T epochs)
-Output: 4-class Cowardin wetland segmentation map
+Output: 3-class Cowardin wetland segmentation map (Upland/Water/Emergent)
 
 Architecture flow:
     For each epoch:
@@ -15,7 +15,7 @@ Architecture flow:
     → TemporalSSMFusion at each scale → fused multi-scale features
     → MambaDecoder with skip connections → decoded features
     → DAG module (with depression depth) → gated features
-    → segmentation head → 4-class prediction
+    → segmentation head → 3-class prediction
 
 References:
     - Jakubik et al. (2024): Prithvi-EO-2.0
@@ -58,6 +58,11 @@ class PrithviEncoder(nn.Module):
     # Default multi-scale channels for Prithvi-300M ViT
     DEFAULT_CHANNELS = [64, 128, 320, 512]
 
+    PRITHVI_IN_CHANS = 6
+    PRITHVI_PATCH_SIZE = 16
+    PRITHVI_HIDDEN_DIM = 768
+    PRITHVI_NUM_LAYERS = 12
+
     def __init__(
         self,
         model_name: str = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
@@ -66,6 +71,7 @@ class PrithviEncoder(nn.Module):
         use_lora: bool = True,
         lora_rank: int = 8,
         feature_channels: Optional[List[int]] = None,
+        allow_proxy: bool = True,
     ) -> None:
         super().__init__()
         self.model_name = model_name
@@ -75,51 +81,73 @@ class PrithviEncoder(nn.Module):
         self._use_lora = use_lora
         self._lora_rank = lora_rank
 
-        # Try to load Prithvi; fall back to CNN proxy for testing/dev
         self._prithvi_loaded = False
         try:
             self._init_prithvi()
-        except (ImportError, OSError, Exception) as e:
+        except (ImportError, OSError, TypeError, ValueError) as e:
+            # TypeError: Prithvi config fields are None (no internet / no cache)
+            # ValueError: config validation failures
             import logging
             logging.getLogger(__name__).warning(
                 "Prithvi unavailable (%s), using CNN proxy encoder", e
             )
+            if not allow_proxy:
+                raise RuntimeError(
+                    f"Prithvi failed to load ({e}) and allow_proxy=False. "
+                    "Ensure HF weights are cached or the node has internet."
+                ) from e
             self._init_cnn_proxy()
 
     def _init_prithvi(self) -> None:
-        """Initialize Prithvi-EO-2.0 from HuggingFace with optional LoRA."""
+        """Initialize Prithvi-EO-2.0 from HuggingFace with optional LoRA.
+
+        Prithvi-EO-2.0 expects input shape (B, C=6, T, H, W). We set
+        num_frames=1 (temporal fusion handled externally by TemporalSSMFusion)
+        and adapt our multi-band input to 6 HLS channels via a 1×1 conv.
+        """
         from transformers import AutoModel
 
         self.prithvi = AutoModel.from_pretrained(
             self.model_name,
             trust_remote_code=True,
+            num_frames=1,
         )
 
-        # Adapt input projection for our 10-band input
-        # Prithvi expects 6 HLS bands; we project 10→6 before feeding
+        # Adapt input: our composite has input_channels bands → project to 6 HLS
         self.input_adapter = nn.Conv2d(
-            self.input_channels, 6, kernel_size=1, bias=False
+            self.input_channels, self.PRITHVI_IN_CHANS,
+            kernel_size=1, bias=False,
         )
 
         # Multi-scale feature extraction via intermediate ViT layers
         # Prithvi-300M has 12 transformer blocks; extract at layers 3, 6, 9, 12
         self.extract_layers = [3, 6, 9, 12]
 
-        # Channel projection to match expected decoder channels
-        vit_dim = self.prithvi.config.hidden_size  # 768 for 300M
-        self.scale_projections = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(vit_dim, ch, 1, bias=False),
-                nn.BatchNorm2d(ch),
-            )
-            for ch in self.feature_channels
-        ])
+        vit_dim = getattr(
+            self.prithvi.config, "hidden_size", self.PRITHVI_HIDDEN_DIM
+        )
 
-        # Apply LoRA if requested
+        # All ViT layers output at the same patch-grid spatial resolution
+        # (H/patch_size, W/patch_size). We create synthetic multi-scale features
+        # by progressively strided-conv-downsampling the patch features.
+        self.scale_projections = nn.ModuleList()
+        for i, ch in enumerate(self.feature_channels):
+            if i == 0:
+                proj = nn.Sequential(
+                    nn.Conv2d(vit_dim, ch, 1, bias=False),
+                    nn.BatchNorm2d(ch),
+                )
+            else:
+                proj = nn.Sequential(
+                    nn.Conv2d(vit_dim, ch, 3, stride=2 ** i, padding=1,
+                              bias=False),
+                    nn.BatchNorm2d(ch),
+                )
+            self.scale_projections.append(proj)
+
         if self._use_lora:
             self._apply_lora()
 
-        # Freeze base Prithvi parameters (only LoRA + adapter are trainable)
         if self._use_pretrained:
             for name, param in self.prithvi.named_parameters():
                 if "lora" not in name:
@@ -175,28 +203,39 @@ class PrithviEncoder(nn.Module):
         return self._forward_proxy(x)
 
     def _forward_prithvi(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Forward through Prithvi with multi-scale extraction."""
-        B, _, H, W = x.shape
+        """Forward through Prithvi with multi-scale extraction.
 
-        # Adapt input channels
+        Prithvi-EO-2.0 expects (B, C=6, T, H, W). All transformer layers
+        output the same spatial size (H/patch, W/patch). We create multi-scale
+        features by projecting different layers with progressive stride.
+        """
+        B, _, H, W = x.shape
+        ps = self.PRITHVI_PATCH_SIZE
+        h_p, w_p = H // ps, W // ps
+
+        # Adapt input channels: (B, in_ch, H, W) → (B, 6, H, W)
         x = self.input_adapter(x)
 
-        # Get intermediate features from Prithvi ViT
+        # Prithvi expects 5D: (B, C, T, H, W) with T=1
+        x = x.unsqueeze(2)
+
         outputs = self.prithvi(x, output_hidden_states=True)
         hidden_states = outputs.hidden_states
 
         features = []
         for i, layer_idx in enumerate(self.extract_layers):
-            # ViT outputs: (B, num_patches, hidden_dim)
+            # ViT hidden states: (B, num_patches, hidden_dim)
             feat = hidden_states[layer_idx]
 
-            # Reshape to spatial: (B, H', W', D) → (B, D, H', W')
-            h = H // (4 * (2 ** i))
-            w = W // (4 * (2 ** i))
-            feat = feat[:, 1:, :]  # remove CLS token
-            feat = feat.transpose(1, 2).reshape(B, -1, h, w)
+            # Some ViTs prepend a CLS token; remove if present
+            expected_patches = h_p * w_p
+            if feat.shape[1] > expected_patches:
+                feat = feat[:, -expected_patches:, :]
 
-            # Project to target channels
+            # Reshape to spatial grid: (B, h_p, w_p, D) → (B, D, h_p, w_p)
+            feat = feat.reshape(B, h_p, w_p, -1).permute(0, 3, 1, 2)
+
+            # Project to target channels (with progressive downsampling)
             feat = self.scale_projections[i](feat)
             features.append(feat)
 
@@ -223,7 +262,7 @@ class WetMamba(nn.Module):
         → segmentation head
 
     Args:
-        num_classes: Number of output classes. Defaults to 4 (Cowardin, PPR-optimized).
+        num_classes: Number of output classes. Defaults to 3 (Upland/Water/Emergent).
         input_channels: Bands per epoch. Defaults to 10.
         encoder_name: Prithvi model ID.
         encoder_channels: Feature channels at each encoder scale.
@@ -235,11 +274,13 @@ class WetMamba(nn.Module):
         use_temporal: Enable temporal SSM fusion. Defaults to True.
         n_epochs_max: Maximum temporal epochs. Defaults to 6.
         d_state: SSM state dimension. Defaults to 16.
+        allow_proxy: If True, fall back to CNN proxy when Prithvi
+            weights unavailable. Set False for benchmark runs to fail loudly.
     """
 
     def __init__(
         self,
-        num_classes: int = 4,
+        num_classes: int = 3,
         input_channels: int = 7,
         encoder_name: str = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
         encoder_channels: Optional[List[int]] = None,
@@ -251,6 +292,7 @@ class WetMamba(nn.Module):
         use_temporal: bool = True,
         n_epochs_max: int = 6,
         d_state: int = 16,
+        allow_proxy: bool = True,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -268,6 +310,7 @@ class WetMamba(nn.Module):
             use_lora=use_lora,
             lora_rank=lora_rank,
             feature_channels=enc_ch,
+            allow_proxy=allow_proxy,
         )
 
         # Temporal SSM fusion at each encoder scale

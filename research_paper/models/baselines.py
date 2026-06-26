@@ -33,7 +33,7 @@ class SMPBaseline(nn.Module):
         arch: Architecture name (e.g., "unetplusplus", "deeplabv3plus").
         encoder_name: Backbone encoder. Defaults to "resnet50".
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 4.
+        num_classes: Output classes. Defaults to 3.
         encoder_weights: Pretrained weights. Defaults to "imagenet".
     """
 
@@ -42,7 +42,7 @@ class SMPBaseline(nn.Module):
         arch: str = "unetplusplus",
         encoder_name: str = "resnet50",
         input_channels: int = 7,
-        num_classes: int = 4,
+        num_classes: int = 3,
         encoder_weights: str = "imagenet",
     ) -> None:
         super().__init__()
@@ -88,15 +88,17 @@ class SegFormerBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 4.
+        num_classes: Output classes. Defaults to 3.
         variant: SegFormer variant (b0-b5). Defaults to "b2".
+        allow_proxy: Fall back to CNN if timm unavailable. False = fail loud.
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 4,
+        num_classes: int = 3,
         variant: str = "b2",
+        allow_proxy: bool = True,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -104,7 +106,11 @@ class SegFormerBaseline(nn.Module):
 
         try:
             self._init_segformer(variant)
-        except (ImportError, Exception):
+        except (ImportError, OSError) as e:
+            if not allow_proxy:
+                raise RuntimeError(
+                    f"SegFormer init failed ({e}) and allow_proxy=False"
+                ) from e
             self._init_fallback()
 
     def _init_segformer(self, variant: str) -> None:
@@ -189,13 +195,15 @@ class SwinUNetBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 4.
+        num_classes: Output classes. Defaults to 3.
+        allow_proxy: Fall back to CNN if timm unavailable. False = fail loud.
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 4,
+        num_classes: int = 3,
+        allow_proxy: bool = True,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -211,7 +219,11 @@ class SwinUNetBaseline(nn.Module):
             )
             enc_channels = self.encoder.feature_info.channels()
             self._use_timm = True
-        except (ImportError, Exception):
+        except (ImportError, OSError) as e:
+            if not allow_proxy:
+                raise RuntimeError(
+                    f"Swin-UNet init failed ({e}) and allow_proxy=False"
+                ) from e
             enc_channels = [96, 192, 384, 768]
             self._build_fallback_encoder(input_channels, enc_channels)
             self._use_timm = False
@@ -288,15 +300,17 @@ class UNetMambaBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 4.
+        num_classes: Output classes. Defaults to 3.
         encoder_name: CNN backbone. Defaults to "resnet50".
+        allow_proxy: Fall back to CNN if timm unavailable. False = fail loud.
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 4,
+        num_classes: int = 3,
         encoder_name: str = "resnet50",
+        allow_proxy: bool = True,
     ) -> None:
         super().__init__()
 
@@ -311,7 +325,11 @@ class UNetMambaBaseline(nn.Module):
             )
             enc_channels = self.encoder.feature_info.channels()
             self._use_timm = True
-        except (ImportError, Exception):
+        except (ImportError, OSError) as e:
+            if not allow_proxy:
+                raise RuntimeError(
+                    f"UNetMamba init failed ({e}) and allow_proxy=False"
+                ) from e
             enc_channels = [64, 128, 256, 512]
             self._build_fallback_encoder(input_channels, enc_channels)
             self._use_timm = False
@@ -379,15 +397,17 @@ class PrithviLinearBaseline(nn.Module):
 
     Args:
         input_channels: Number of input bands. Defaults to 10.
-        num_classes: Output classes. Defaults to 4.
+        num_classes: Output classes. Defaults to 3.
         encoder_name: Prithvi model ID.
+        allow_proxy: Fall back to CNN if Prithvi unavailable. False = fail loud.
     """
 
     def __init__(
         self,
         input_channels: int = 7,
-        num_classes: int = 4,
+        num_classes: int = 3,
         encoder_name: str = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
+        allow_proxy: bool = True,
     ) -> None:
         super().__init__()
         from research_paper.models.wetmamba import PrithviEncoder
@@ -397,6 +417,7 @@ class PrithviLinearBaseline(nn.Module):
             input_channels=input_channels,
             use_pretrained=True,
             use_lora=False,
+            allow_proxy=allow_proxy,
         )
 
         total_channels = sum(self.encoder.feature_channels)
@@ -430,8 +451,9 @@ class PrithviLinearBaseline(nn.Module):
 
 def build_model(
     name: str,
-    num_classes: int = 4,
+    num_classes: int = 3,
     input_channels: int = 7,
+    allow_proxy: bool = True,
     **kwargs,
 ) -> nn.Module:
     """Factory function to build any benchmark model by name.
@@ -442,6 +464,9 @@ def build_model(
             "swin_unet", "unetmamba", "prithvi_linear", or any SMP arch.
         num_classes: Output classes.
         input_channels: Input bands per epoch.
+        allow_proxy: Allow CNN proxy when FM weights unavailable.
+            Set False for benchmark runs to fail loudly instead of
+            silently degrading to a CNN.
         **kwargs: Additional model-specific arguments.
 
     Returns:
@@ -455,6 +480,7 @@ def build_model(
         return WetMamba(
             num_classes=num_classes,
             input_channels=input_channels,
+            allow_proxy=allow_proxy,
             **kwargs,
         )
 
@@ -462,6 +488,7 @@ def build_model(
         return SegFormerBaseline(
             input_channels=input_channels,
             num_classes=num_classes,
+            allow_proxy=allow_proxy,
             **kwargs,
         )
 
@@ -469,6 +496,7 @@ def build_model(
         return SwinUNetBaseline(
             input_channels=input_channels,
             num_classes=num_classes,
+            allow_proxy=allow_proxy,
             **kwargs,
         )
 
@@ -476,6 +504,7 @@ def build_model(
         return UNetMambaBaseline(
             input_channels=input_channels,
             num_classes=num_classes,
+            allow_proxy=allow_proxy,
             **kwargs,
         )
 
@@ -483,10 +512,11 @@ def build_model(
         return PrithviLinearBaseline(
             input_channels=input_channels,
             num_classes=num_classes,
+            allow_proxy=allow_proxy,
             **kwargs,
         )
 
-    # Default: SMP baseline
+    # Default: SMP baseline (no proxy concept — always real)
     return SMPBaseline(
         arch=name,
         input_channels=input_channels,
