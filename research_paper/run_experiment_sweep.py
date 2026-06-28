@@ -296,6 +296,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Ensure repo root is on sys.path (handles running as a script)
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
