@@ -131,7 +131,7 @@ FIXED_HPARAMS = {
     "batch_size": 32,
     "val_split": 0.2,
     "num_classes": 3,
-    "in_channels": 10,
+    "in_channels": 9,
     "ignore_index": 255,
     "seed": 42,
     "max_class_weight": 50.0,

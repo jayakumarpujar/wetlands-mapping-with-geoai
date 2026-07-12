@@ -66,7 +66,7 @@ class PrithviEncoder(nn.Module):
     def __init__(
         self,
         model_name: str = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
-        input_channels: int = 7,
+        input_channels: int = 9,
         use_pretrained: bool = True,
         use_lora: bool = True,
         lora_rank: int = 8,
@@ -369,7 +369,7 @@ class WetMamba(nn.Module):
     def __init__(
         self,
         num_classes: int = 3,
-        input_channels: int = 7,
+        input_channels: int = 9,
         encoder_name: str = "ibm-nasa-geospatial/Prithvi-EO-2.0-300M",
         encoder_channels: Optional[List[int]] = None,
         decoder_channels: Optional[List[int]] = None,

@@ -119,7 +119,7 @@ EXPERIMENT_DEFAULTS: Dict[str, Any] = {
     "weight_decay": 1e-4,
     "val_split": 0.2,
     "num_classes": 3,
-    "in_channels": 10,
+    "in_channels": 9,
     "loss_function": "unified_focal",
     "use_class_weights": True,
     "ignore_index": IGNORE_INDEX,
