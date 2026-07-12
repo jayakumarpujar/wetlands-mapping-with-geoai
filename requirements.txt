@@ -30,3 +30,4 @@ wandb>=0.16.0
 
 # Testing
 pytest>=7.0.0
+
