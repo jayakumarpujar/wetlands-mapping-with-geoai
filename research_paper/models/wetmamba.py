@@ -149,12 +149,18 @@ class PrithviEncoder(nn.Module):
                 "Re-run cache_prithvi.sh on the login node."
             )
 
-        # Import prithvi_mae.py by explicit path to register prithvi_eo_v2_300 with timm.
-        # importlib.import_module("prithvi_mae") via sys.path is unreliable when
-        # snapshot_download returns a symlink-resolved path at runtime.
+        # Import prithvi_mae.py to register prithvi_eo_v2_300 with timm.
+        # Must: (1) add snapshot_dir to sys.path so prithvi_mae.py's own relative
+        # imports resolve, (2) register in sys.modules BEFORE exec_module so any
+        # circular import or trust_remote_code lookup by name succeeds.
+        snapshot_str = str(snapshot_dir)
+        if snapshot_str not in sys.path:
+            sys.path.insert(0, snapshot_str)
+
         prithvi_mae_file = Path(snapshot_dir) / "prithvi_mae.py"
         _spec = importlib.util.spec_from_file_location("prithvi_mae", prithvi_mae_file)
         _mod = importlib.util.module_from_spec(_spec)
+        sys.modules.setdefault("prithvi_mae", _mod)
         _spec.loader.exec_module(_mod)
 
         config = AutoConfig.from_pretrained(
