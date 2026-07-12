@@ -60,8 +60,8 @@ class PrithviEncoder(nn.Module):
 
     PRITHVI_IN_CHANS = 6
     PRITHVI_PATCH_SIZE = 16
-    PRITHVI_HIDDEN_DIM = 768
-    PRITHVI_NUM_LAYERS = 12
+    PRITHVI_HIDDEN_DIM = 1024   # Prithvi-EO-2.0-300M is ViT-L (embed_dim=1024)
+    PRITHVI_NUM_LAYERS = 24     # ViT-L depth
 
     def __init__(
         self,
@@ -110,79 +110,91 @@ class PrithviEncoder(nn.Module):
     def _init_prithvi(self) -> None:
         """Initialize Prithvi-EO-2.0 from HuggingFace cache.
 
-        Strategy: Prithvi stores weights as Prithvi_EO_V2_300M.pt (non-standard).
-        AutoModel.from_pretrained can't find them. We instead:
+        prithvi_mae.py defines PrithviViT as a raw PyTorch class (no HF registration,
+        no timm @register_model). We bypass AutoModel entirely:
           1. snapshot_download → get local cache path
-          2. import prithvi_mae.py → registers prithvi_eo_v2_300 with timm
-          3. AutoModel.from_config → build arch (timm now knows it)
-          4. torch.load Prithvi_EO_V2_300M.pt → inject weights manually
+          2. exec prithvi_mae.py → import PrithviViT class directly
+          3. instantiate PrithviViT with 300M (ViT-L) params
+          4. register forward hooks on blocks for multi-scale feature extraction
+          5. torch.load Prithvi_EO_V2_300M.pt → inject weights manually
         """
-        import importlib
         import importlib.util
         import sys
-        from pathlib import Path
-
-        import torch
-        from huggingface_hub import snapshot_download
-        from transformers import AutoConfig, AutoModel
-
-        # Pass cache_dir explicitly so path matches however the cache was populated.
-        # HF_HOME=$X puts hub cache at $X/hub/, but snapshot_download cache_dir=$X
-        # puts it at $X/ directly. We support both: try HF_HOME/hub first, fall
-        # back to HF_HOME itself.
         import os
+        from pathlib import Path
+        import torch
+
+        from huggingface_hub import snapshot_download
+
         hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        snapshot_dir = None
         for _cache_dir in [hf_home, str(Path(hf_home) / "hub")]:
             try:
-                snapshot_dir = snapshot_download(
+                sd = snapshot_download(
                     repo_id=self.model_name,
                     cache_dir=_cache_dir,
                     local_files_only=True,
                 )
-                if (Path(snapshot_dir) / "prithvi_mae.py").exists():
+                if (Path(sd) / "prithvi_mae.py").exists():
+                    snapshot_dir = sd
                     break
             except Exception:
                 continue
-        else:
+        if snapshot_dir is None:
             raise FileNotFoundError(
                 f"prithvi_mae.py not found in HF cache under {hf_home}. "
                 "Re-run cache_prithvi.sh on the login node."
             )
 
-        # Import prithvi_mae.py to register prithvi_eo_v2_300 with timm.
-        # Must: (1) add snapshot_dir to sys.path so prithvi_mae.py's own relative
-        # imports resolve, (2) register in sys.modules BEFORE exec_module so any
-        # circular import or trust_remote_code lookup by name succeeds.
+        # Load PrithviViT class directly from prithvi_mae.py.
         snapshot_str = str(snapshot_dir)
         if snapshot_str not in sys.path:
             sys.path.insert(0, snapshot_str)
-
         prithvi_mae_file = Path(snapshot_dir) / "prithvi_mae.py"
         _spec = importlib.util.spec_from_file_location("prithvi_mae", prithvi_mae_file)
         _mod = importlib.util.module_from_spec(_spec)
         sys.modules.setdefault("prithvi_mae", _mod)
-        _spec.loader.exec_module(_mod)
+        try:
+            _spec.loader.exec_module(_mod)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load prithvi_mae.py: {exc}") from exc
 
-        config = AutoConfig.from_pretrained(
-            snapshot_dir,
-            trust_remote_code=True,
+        PrithviViT = _mod.PrithviViT
+
+        # Prithvi-EO-2.0-300M: ViT-L (embed_dim=1024, depth=24, heads=16)
+        # num_frames=1: we feed a single composite (no temporal stack at encoder level)
+        self.prithvi = PrithviViT(
+            img_size=224,
             num_frames=1,
-            num_labels=3,
-            local_files_only=True,
+            patch_size=[1, 16, 16],
+            in_chans=self.PRITHVI_IN_CHANS,
+            embed_dim=self.PRITHVI_HIDDEN_DIM,
+            depth=self.PRITHVI_NUM_LAYERS,
+            num_heads=16,
+            mlp_ratio=4.0,
+            coords_encoding=[],
         )
 
-        # Build architecture (timm arch now registered via prithvi_mae import)
-        self.prithvi = AutoModel.from_config(config, trust_remote_code=True)
+        # Register forward hooks to capture intermediate block outputs.
+        # hooks store (B, num_patches, embed_dim) token sequences keyed by 1-based layer index.
+        self._hook_outputs: dict = {}
+
+        def _make_hook(idx: int):
+            def _hook(module, inp, out):
+                self._hook_outputs[idx] = out
+            return _hook
+
+        for layer_idx in self.extract_layers:
+            self.prithvi.blocks[layer_idx - 1].register_forward_hook(
+                _make_hook(layer_idx)
+            )
 
         if self._use_pretrained:
             weights_path = Path(snapshot_dir) / "Prithvi_EO_V2_300M.pt"
             state_dict = torch.load(weights_path, map_location="cpu")
-            # Checkpoint may wrap weights under 'model' key
             if isinstance(state_dict, dict) and "model" in state_dict:
                 state_dict = state_dict["model"]
-            missing, unexpected = self.prithvi.load_state_dict(
-                state_dict, strict=False
-            )
+            missing, unexpected = self.prithvi.load_state_dict(state_dict, strict=False)
             import logging
             _log = logging.getLogger(__name__)
             if missing:
@@ -190,7 +202,6 @@ class PrithviEncoder(nn.Module):
             if unexpected:
                 _log.warning("Prithvi: %d unexpected keys", len(unexpected))
         else:
-            # no_pretrained ablation: architecture with random weights
             self.prithvi.apply(self._random_init_weights)
 
         # Adapt input: our composite has input_channels bands → project to 6 HLS
@@ -199,13 +210,11 @@ class PrithviEncoder(nn.Module):
             kernel_size=1, bias=False,
         )
 
-        # Multi-scale feature extraction via intermediate ViT layers
-        # Prithvi-300M has 12 transformer blocks; extract at layers 3, 6, 9, 12
-        self.extract_layers = [3, 6, 9, 12]
+        # Multi-scale feature extraction via intermediate ViT layers.
+        # Prithvi-300M is ViT-L with depth=24; evenly sample at 4 points.
+        self.extract_layers = [6, 12, 18, 24]
 
-        vit_dim = getattr(
-            self.prithvi.config, "hidden_size", self.PRITHVI_HIDDEN_DIM
-        )
+        vit_dim = self.PRITHVI_HIDDEN_DIM
 
         # All ViT layers output at the same patch-grid spatial resolution
         # (H/patch_size, W/patch_size). We create synthetic multi-scale features
@@ -283,11 +292,10 @@ class PrithviEncoder(nn.Module):
         return self._forward_proxy(x)
 
     def _forward_prithvi(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Forward through Prithvi with multi-scale extraction.
+        """Forward through PrithviViT with multi-scale extraction via registered hooks.
 
-        Prithvi-EO-2.0 expects (B, C=6, T, H, W). All transformer layers
-        output the same spatial size (H/patch, W/patch). We create multi-scale
-        features by projecting different layers with progressive stride.
+        PrithviViT expects (B, C=6, T, H, W). Forward hooks capture block outputs
+        at self.extract_layers; we reshape tokens → spatial grids and project.
         """
         B, _, H, W = x.shape
         ps = self.PRITHVI_PATCH_SIZE
@@ -296,26 +304,25 @@ class PrithviEncoder(nn.Module):
         # Adapt input channels: (B, in_ch, H, W) → (B, 6, H, W)
         x = self.input_adapter(x)
 
-        # Prithvi expects 5D: (B, C, T, H, W) with T=1
+        # PrithviViT expects 5D: (B, C, T, H, W) with T=num_frames=1
         x = x.unsqueeze(2)
 
-        outputs = self.prithvi(x, output_hidden_states=True)
-        hidden_states = outputs.hidden_states
+        self._hook_outputs.clear()
+        self.prithvi(x)  # hooks populate _hook_outputs
 
         features = []
+        expected_patches = h_p * w_p
         for i, layer_idx in enumerate(self.extract_layers):
-            # ViT hidden states: (B, num_patches, hidden_dim)
-            feat = hidden_states[layer_idx]
+            # Hook output: (B, num_patches [+ CLS], hidden_dim)
+            feat = self._hook_outputs[layer_idx]
 
-            # Some ViTs prepend a CLS token; remove if present
-            expected_patches = h_p * w_p
+            # Strip CLS token if present (prepended, so take last expected_patches)
             if feat.shape[1] > expected_patches:
                 feat = feat[:, -expected_patches:, :]
 
             # Reshape to spatial grid: (B, h_p, w_p, D) → (B, D, h_p, w_p)
             feat = feat.reshape(B, h_p, w_p, -1).permute(0, 3, 1, 2)
 
-            # Project to target channels (with progressive downsampling)
             feat = self.scale_projections[i](feat)
             features.append(feat)
 
