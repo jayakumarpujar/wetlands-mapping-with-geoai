@@ -104,14 +104,28 @@ class PrithviEncoder(nn.Module):
         Prithvi-EO-2.0 expects input shape (B, C=6, T, H, W). We set
         num_frames=1 (temporal fusion handled externally by TemporalSSMFusion)
         and adapt our multi-band input to 6 HLS channels via a 1×1 conv.
-        """
-        from transformers import AutoModel
 
-        self.prithvi = AutoModel.from_pretrained(
+        num_labels=3 overrides the null stored in Prithvi's config.json which
+        causes range(None) → TypeError in TimmWrapperConfig.__post_init__.
+        """
+        from transformers import AutoConfig, AutoModel
+
+        config = AutoConfig.from_pretrained(
             self.model_name,
             trust_remote_code=True,
             num_frames=1,
+            num_labels=3,
         )
+
+        if self._use_pretrained:
+            self.prithvi = AutoModel.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                config=config,
+            )
+        else:
+            # no_pretrained ablation: build Prithvi architecture with random weights
+            self.prithvi = AutoModel.from_config(config, trust_remote_code=True)
 
         # Adapt input: our composite has input_channels bands → project to 6 HLS
         self.input_adapter = nn.Conv2d(
