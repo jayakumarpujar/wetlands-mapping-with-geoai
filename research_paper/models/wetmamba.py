@@ -308,7 +308,8 @@ class PrithviEncoder(nn.Module):
         x = x.unsqueeze(2)
 
         self._hook_outputs.clear()
-        self.prithvi(x)  # hooks populate _hook_outputs
+        # mask_ratio=0.0: keep all patches (MAE default 0.75 would drop 75%)
+        self.prithvi(x, mask_ratio=0.0)  # hooks populate _hook_outputs
 
         features = []
         expected_patches = h_p * w_p
