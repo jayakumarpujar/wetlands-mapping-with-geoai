@@ -11,13 +11,13 @@ mkdir -p $HF_CACHE
 
 echo "Downloading Prithvi-EO-2.0-300M → $HF_CACHE"
 python -c "
-from transformers import AutoModel, AutoConfig
+from transformers import AutoConfig, AutoModel
 cache = '$HF_CACHE'
 model_id = 'ibm-nasa-geospatial/Prithvi-EO-2.0-300M'
 print('Fetching config...')
-AutoConfig.from_pretrained(model_id, trust_remote_code=True, cache_dir=cache)
+config = AutoConfig.from_pretrained(model_id, trust_remote_code=True, num_labels=3, cache_dir=cache)
 print('Fetching model weights...')
-AutoModel.from_pretrained(model_id, trust_remote_code=True, cache_dir=cache)
+AutoModel.from_pretrained(model_id, trust_remote_code=True, config=config, cache_dir=cache)
 print('Done. Cache at:', cache)
 "
 
