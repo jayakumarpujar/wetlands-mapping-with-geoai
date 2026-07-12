@@ -177,6 +177,8 @@ class PrithviEncoder(nn.Module):
 
         # Register forward hooks to capture intermediate block outputs.
         # hooks store (B, num_patches, embed_dim) token sequences keyed by 1-based layer index.
+        # extract_layers set here so hooks can reference it; __init__ reads it back out.
+        self.extract_layers = [6, 12, 18, 24]
         self._hook_outputs: dict = {}
 
         def _make_hook(idx: int):
@@ -210,9 +212,7 @@ class PrithviEncoder(nn.Module):
             kernel_size=1, bias=False,
         )
 
-        # Multi-scale feature extraction via intermediate ViT layers.
-        # Prithvi-300M is ViT-L with depth=24; evenly sample at 4 points.
-        self.extract_layers = [6, 12, 18, 24]
+        # extract_layers already set in _init_prithvi (needed before hook registration)
 
         vit_dim = self.PRITHVI_HIDDEN_DIM
 
