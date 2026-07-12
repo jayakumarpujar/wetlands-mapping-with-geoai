@@ -76,13 +76,21 @@ class TrainConfig:
     model_name: str = "wetmamba"
     ablation: Optional[str] = None
     num_classes: int = 3
-    input_channels: int = 7
+    input_channels: int = 10
     tile_size: int = 256
     batch_size: int = 8
     epochs: int = 100
     lr: float = 1e-4
     allow_proxy: bool = False
     weight_decay: float = 1e-4
+    loss_function: str = "unified_focal"
+    use_class_weights: bool = True
+    ignore_index: int = 255
+    max_class_weight: float = 50.0
+    focal_gamma: float = 2.0
+    ufl_lambda: float = 0.5
+    ufl_gamma: float = 0.75
+    ufl_delta: float = 0.6
     scheduler: str = "cosine"
     warmup_epochs: int = 5
     num_workers: int = 4
@@ -104,11 +112,11 @@ class TrainConfig:
     mixed_precision: bool = True
 
     def experiment_name(self) -> str:
-        """Generate experiment name from config."""
         name = self.model_name
         if self.ablation:
             name = f"{name}_{self.ablation}"
-        return f"{name}_ep{self.epochs}_bs{self.batch_size}_lr{self.lr}"
+        wt = "w" if self.use_class_weights else "nw"
+        return f"{name}_{self.loss_function}_{wt}_ep{self.epochs}_bs{self.batch_size}"
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +456,63 @@ def build_scheduler(
 
 
 # ---------------------------------------------------------------------------
+# Loss builder
+# ---------------------------------------------------------------------------
+
+def _build_criterion(config: TrainConfig, dataset: "WetlandTileDataset") -> nn.Module:
+    """Build loss function, optionally with inverse-frequency class weights."""
+    ignore_index = config.ignore_index
+
+    if config.use_class_weights:
+        counts = np.zeros(config.num_classes, dtype=np.float64)
+        for i in range(min(len(dataset.tile_paths), 500)):
+            import rasterio
+            lbl_path = dataset.label_dir / dataset.tile_paths[i].name
+            try:
+                with rasterio.open(lbl_path) as src:
+                    lbl = src.read(1).ravel()
+            except Exception:
+                continue
+            for c in range(config.num_classes):
+                counts[c] += np.sum(lbl == c)
+        counts = np.where(counts == 0, 1, counts)
+        inv_freq = counts.sum() / (config.num_classes * counts)
+        inv_freq = np.clip(inv_freq, 1.0, config.max_class_weight)
+        weights = torch.tensor(inv_freq, dtype=torch.float32).to(config.device)
+    else:
+        weights = None
+
+    lf = config.loss_function
+    if lf == "crossentropy":
+        return nn.CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
+    if lf == "focal":
+        try:
+            from geoai.losses import FocalLoss
+            return FocalLoss(gamma=config.focal_gamma, weight=weights, ignore_index=ignore_index)
+        except ImportError:
+            return nn.CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
+    if lf in ("unified_focal", "ce_dice"):
+        try:
+            from geoai.losses import UnifiedFocalLoss
+            return UnifiedFocalLoss(
+                lmbda=config.ufl_lambda,
+                gamma=config.ufl_gamma,
+                delta=config.ufl_delta,
+                weight=weights,
+                ignore_index=ignore_index,
+            )
+        except ImportError:
+            return nn.CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
+    if lf == "dice":
+        try:
+            from geoai.losses import DiceLoss
+            return DiceLoss(weight=weights, ignore_index=ignore_index)
+        except ImportError:
+            return nn.CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
+    return nn.CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -513,7 +578,7 @@ def train(config: TrainConfig) -> Dict[str, Any]:
     )
 
     # Loss, optimizer, scheduler
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    criterion = _build_criterion(config, train_dataset)
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config)
 

@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Systematic experiment sweep: architecture × loss × class-weights.
+"""Systematic experiment sweep: CNN baselines + WetMamba.
 
-Trains all combinations on pre-existing tiles, evaluates on test tiles,
-and writes a unified comparison JSON + summary table.
+Phase 1 (CNN): 2 architectures × 5 loss configs = 10 runs  (already done)
+Phase 2 (WetMamba): full model + 4 ablations = 5 runs
+
+All runs are resumable — already-trained models are skipped automatically.
 
 Usage (HPC, GPU node):
+    # Full sweep (CNN + WetMamba)
     python research_paper/run_experiment_sweep.py \
         --train-tiles /home/john_lab/shared/Jay/wetlands_data/tiles \
         --test-tiles  /home/john_lab/shared/Jay/wetlands_testdata/tiles \
         --output-root /home/john_lab/shared/Jay/wetlands_data/sweep \
         -v
 
+    # WetMamba only (skip already-done CNN runs)
+    python research_paper/run_experiment_sweep.py ... --wetmamba-only -v
+
 SLURM example:
-    #SBATCH --partition=gpu --gres=gpu:1 --mem=64G --time=24:00:00
+    #SBATCH --partition=gpu --gres=gpu:1 --mem=64G --time=48:00:00
     python research_paper/run_experiment_sweep.py \
         --train-tiles $DATA/tiles --test-tiles $TEST/tiles \
         --output-root $DATA/sweep -v
@@ -35,9 +41,50 @@ log = logging.getLogger(__name__)
 # Experiment grid
 # ---------------------------------------------------------------------------
 
+# Phase 1: CNN baselines (10 runs)
 ARCHITECTURES = [
     {"architecture": "unetplusplus", "encoder_name": "resnet50"},
     {"architecture": "deeplabv3plus", "encoder_name": "resnet50"},
+]
+
+# Phase 2: WetMamba — best loss config + 4 ablations (5 runs)
+# Ablations prove each component's contribution for the paper.
+WETMAMBA_BEST_LOSS = {
+    "loss_function": "unified_focal",
+    "use_class_weights": True,
+    "loss_name": "unified_focal_weighted",
+}
+WETMAMBA_RUNS = [
+    {
+        "run_id": "wetmamba_full",
+        "ablation": None,
+        "description": "WetMamba full: Prithvi + Mamba + DAG + TemporalSSM",
+        **WETMAMBA_BEST_LOSS,
+    },
+    {
+        "run_id": "wetmamba_no_dag",
+        "ablation": "no_dag",
+        "description": "WetMamba ablation: no Depression-Aware Gating",
+        **WETMAMBA_BEST_LOSS,
+    },
+    {
+        "run_id": "wetmamba_no_temporal",
+        "ablation": "no_temporal",
+        "description": "WetMamba ablation: no temporal SSM fusion",
+        **WETMAMBA_BEST_LOSS,
+    },
+    {
+        "run_id": "wetmamba_no_mamba",
+        "ablation": "no_mamba",
+        "description": "WetMamba ablation: ViT decoder instead of Mamba",
+        **WETMAMBA_BEST_LOSS,
+    },
+    {
+        "run_id": "wetmamba_no_pretrained",
+        "ablation": "no_pretrained",
+        "description": "WetMamba ablation: random-init encoder (no Prithvi FM)",
+        **WETMAMBA_BEST_LOSS,
+    },
 ]
 
 LOSS_CONFIGS = [
@@ -107,9 +154,10 @@ class ExperimentRun:
     loss_function: str
     use_class_weights: bool
     description: str
+    ablation: Optional[str] = None  # None = CNN run; set = WetMamba ablation
 
 
-def _build_runs() -> List[ExperimentRun]:
+def _build_cnn_runs() -> List[ExperimentRun]:
     runs = []
     for arch in ARCHITECTURES:
         for loss_cfg in LOSS_CONFIGS:
@@ -123,6 +171,22 @@ def _build_runs() -> List[ExperimentRun]:
                 use_class_weights=loss_cfg["use_class_weights"],
                 description=loss_cfg["description"],
             ))
+    return runs
+
+
+def _build_wetmamba_runs() -> List[ExperimentRun]:
+    runs = []
+    for cfg in WETMAMBA_RUNS:
+        runs.append(ExperimentRun(
+            run_id=cfg["run_id"],
+            architecture="wetmamba",
+            encoder_name="prithvi",
+            loss_name=cfg["loss_name"],
+            loss_function=cfg["loss_function"],
+            use_class_weights=cfg["use_class_weights"],
+            description=cfg["description"],
+            ablation=cfg["ablation"],
+        ))
     return runs
 
 
@@ -217,6 +281,93 @@ def evaluate_one(
 
 
 # ---------------------------------------------------------------------------
+# WetMamba train / eval
+# ---------------------------------------------------------------------------
+
+def train_wetmamba(
+    run: ExperimentRun,
+    train_tiles: Path,
+    output_dir: Path,
+    num_workers: int,
+) -> Dict[str, Any]:
+    from research_paper.train_benchmark import TrainConfig, train as bm_train
+
+    model_dir = output_dir / "models" / run.run_id
+    best_model = model_dir / "best_model.pt"
+
+    if best_model.exists():
+        log.info("  SKIP (already trained): %s", best_model)
+        return {"model_path": str(best_model), "skipped": True}
+
+    log.info("  Training WetMamba [%s] ...", run.run_id)
+    t0 = time.time()
+
+    config = TrainConfig(
+        model_name="wetmamba",
+        ablation=run.ablation,
+        num_classes=FIXED_HPARAMS["num_classes"],
+        input_channels=FIXED_HPARAMS["in_channels"],
+        epochs=FIXED_HPARAMS["num_epochs"],
+        batch_size=8,  # V100 32GB — Prithvi-300M needs smaller batch
+        lr=FIXED_HPARAMS["learning_rate"],
+        weight_decay=FIXED_HPARAMS["weight_decay"],
+        loss_function=run.loss_function,
+        use_class_weights=run.use_class_weights,
+        ignore_index=FIXED_HPARAMS["ignore_index"],
+        max_class_weight=FIXED_HPARAMS["max_class_weight"],
+        focal_gamma=FIXED_HPARAMS["focal_gamma"],
+        ufl_lambda=FIXED_HPARAMS["ufl_lambda"],
+        ufl_gamma=FIXED_HPARAMS["ufl_gamma"],
+        ufl_delta=FIXED_HPARAMS["ufl_delta"],
+        allow_proxy=False,
+        num_workers=num_workers,
+        data_dir=str(train_tiles),
+        output_dir=str(model_dir),
+    )
+
+    result = bm_train(config)
+    elapsed = time.time() - t0
+    log.info("  WetMamba trained in %.0fs, best_mIoU=%.4f", elapsed, result.get("best_miou", 0))
+    return {
+        "model_path": str(model_dir / config.experiment_name() / "best_model.pt"),
+        "train_time_s": round(elapsed, 1),
+        "skipped": False,
+        **result,
+    }
+
+
+def evaluate_wetmamba(
+    run: ExperimentRun,
+    model_path: str,
+    test_tiles: Path,
+    output_dir: Path,
+    num_workers: int,
+) -> Dict[str, Any]:
+    from research_paper.evaluate_tiles import evaluate
+
+    results_dir = output_dir / "results" / run.run_id
+    metrics_file = results_dir / "test_metrics.json"
+
+    if metrics_file.exists():
+        log.info("  SKIP eval (already done): %s", metrics_file)
+        with open(metrics_file) as f:
+            return json.load(f)
+
+    log.info("  Evaluating WetMamba %s ...", run.run_id)
+    return evaluate(
+        model_path=model_path,
+        tiles_dir=str(test_tiles),
+        output_dir=str(results_dir),
+        architecture="wetmamba",
+        encoder_name="prithvi",
+        in_channels=FIXED_HPARAMS["in_channels"],
+        num_classes=FIXED_HPARAMS["num_classes"],
+        batch_size=8,
+        num_workers=num_workers,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -236,8 +387,12 @@ def _build_summary(
     )
     sep = "-" * len(header)
 
-    lines = ["\n" + sep, header, sep]
-    for r in sorted(all_results, key=lambda x: -x.get("mean_iou", 0)):
+    # Separate WetMamba from CNN for cleaner table sections
+    cnn_rows = [r for r in all_results if r.get("architecture") != "wetmamba"]
+    wm_rows  = [r for r in all_results if r.get("architecture") == "wetmamba"]
+
+    lines = ["\n" + sep, "CNN BASELINES", header, sep]
+    for r in sorted(cnn_rows, key=lambda x: -x.get("mean_iou", 0)):
         pc = r.get("per_class", {})
         lines.append(
             f"{r['run_id']:<55} {r['architecture']:<15} "
@@ -249,6 +404,20 @@ def _build_summary(
             f"{pc.get('Emergent', {}).get('iou', 0):>7.4f} "
             f"{r.get('train_time_s', 0) / 60:>5.0f}m"
         )
+    if wm_rows:
+        lines += [sep, "WETMAMBA", header, sep]
+        for r in sorted(wm_rows, key=lambda x: -x.get("mean_iou", 0)):
+            pc = r.get("per_class", {})
+            lines.append(
+                f"{r['run_id']:<55} {r['architecture']:<15} "
+                f"{r['loss_name']:<25} {'Y' if r['use_class_weights'] else 'N':>3} "
+                f"{r.get('overall_accuracy', 0):>6.4f} "
+                f"{r.get('mean_iou', 0):>6.4f} "
+                f"{pc.get('Upland', {}).get('iou', 0):>7.4f} "
+                f"{pc.get('Water', {}).get('iou', 0):>7.4f} "
+                f"{pc.get('Emergent', {}).get('iou', 0):>7.4f} "
+                f"{r.get('train_time_s', 0) / 60:>5.0f}m"
+            )
     lines.append(sep)
 
     table = "\n".join(lines)
@@ -291,6 +460,14 @@ def main() -> None:
         help="Skip training, only evaluate existing models.",
     )
     parser.add_argument(
+        "--wetmamba-only", action="store_true",
+        help="Run WetMamba runs only (skip CNN baseline runs).",
+    )
+    parser.add_argument(
+        "--cnn-only", action="store_true",
+        help="Run CNN baseline runs only (skip WetMamba runs).",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="DEBUG-level logging.",
     )
@@ -324,10 +501,12 @@ def main() -> None:
     ))
     logging.getLogger().addHandler(file_handler)
 
-    runs = _build_runs()
+    cnn_runs = [] if args.wetmamba_only else _build_cnn_runs()
+    wm_runs = [] if args.cnn_only else _build_wetmamba_runs()
+    runs = cnn_runs + wm_runs
     log.info("=" * 70)
-    log.info("EXPERIMENT SWEEP: %d runs (%d archs × %d loss configs)",
-             len(runs), len(ARCHITECTURES), len(LOSS_CONFIGS))
+    log.info("EXPERIMENT SWEEP: %d runs (%d CNN + %d WetMamba)",
+             len(runs), len(cnn_runs), len(wm_runs))
     log.info("  Train tiles : %s", train_tiles)
     log.info("  Test tiles  : %s", test_tiles)
     log.info("  Output      : %s", output_dir)
@@ -365,12 +544,14 @@ def main() -> None:
         }
 
         # --- Train ---
+        is_wetmamba = run.architecture == "wetmamba"
         model_path = None
         if not args.skip_train:
             try:
-                train_result = train_one(
-                    run, train_tiles, output_dir, args.num_workers,
-                )
+                if is_wetmamba:
+                    train_result = train_wetmamba(run, train_tiles, output_dir, args.num_workers)
+                else:
+                    train_result = train_one(run, train_tiles, output_dir, args.num_workers)
                 model_path = train_result.get("model_path")
                 result_entry["train_time_s"] = train_result.get("train_time_s", 0)
                 result_entry["skipped_train"] = train_result.get("skipped", False)
@@ -380,7 +561,9 @@ def main() -> None:
                 all_results.append(result_entry)
                 continue
         else:
-            candidate = output_dir / "models" / run.run_id / "best_model.pth"
+            # WetMamba saves best_model.pt; CNN saves best_model.pth
+            suffix = ".pt" if is_wetmamba else ".pth"
+            candidate = output_dir / "models" / run.run_id / f"best_model{suffix}"
             if candidate.exists():
                 model_path = str(candidate)
             else:
@@ -391,9 +574,14 @@ def main() -> None:
         # --- Evaluate ---
         if model_path:
             try:
-                metrics = evaluate_one(
-                    run, model_path, test_tiles, output_dir, args.num_workers,
-                )
+                if is_wetmamba:
+                    metrics = evaluate_wetmamba(
+                        run, model_path, test_tiles, output_dir, args.num_workers,
+                    )
+                else:
+                    metrics = evaluate_one(
+                        run, model_path, test_tiles, output_dir, args.num_workers,
+                    )
                 result_entry.update(metrics)
             except Exception:
                 log.exception("  EVAL FAILED for %s", run.run_id)

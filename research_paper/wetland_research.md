@@ -700,17 +700,49 @@ toward ~0.70 (mean of Upland 0.90, Water 0.65, Emergent 0.53) and frees capacity
 the model cannot learn. This is a measurement-integrity fix, not metric-gaming — the masked
 pixels are genuinely unsupervisable under weak labels.
 
-### 8.5b Test Results — 3-class (pending re-run)
+### 8.5b Systematic Sweep — 3-class baselines (2026-07-12)
 
-After regenerating ND weak labels with `ignore_index=255` and retraining on the 3-class
-schema, populate the table below (UNet++/ResNet-50 for baseline parity; WetMamba alongside).
+10 runs: 2 architectures (UNet++, DeepLabV3+) × 5 loss configs × class-weight on/off.
+Fixed: ResNet-50 encoder, lr=3×10⁻⁴, 100 epochs, batch=32, 5,017 test tiles (328M px).
+
+#### Full sweep results (sorted by mIoU)
+
+| Architecture | Loss | Weights | mIoU | Upland IoU | Water IoU | Emergent IoU | OA |
+|---|---|---|---|---|---|---|---|
+| **DeepLabV3+** | unified_focal | ✓ | **0.634** | 0.871 | 0.551 | **0.481** | 0.851 |
+| DeepLabV3+ | unified_focal | ✗ | 0.621 | 0.871 | 0.533 | 0.461 | 0.852 |
+| DeepLabV3+ | dice | ✓ | 0.609 | 0.868 | 0.543 | 0.417 | 0.849 |
+| DeepLabV3+ | crossentropy | ✓ | 0.599 | 0.869 | 0.476 | 0.451 | 0.844 |
+| UNet++ | crossentropy | ✓ | 0.598 | **0.875** | 0.480 | 0.440 | **0.845** |
+| UNet++ | unified_focal | ✗ | 0.587 | 0.851 | 0.546 | 0.364 | 0.840 |
+| UNet++ | unified_focal | ✓ | 0.569 | 0.794 | 0.497 | 0.416 | 0.792 |
+| UNet++ | dice | ✓ | 0.555 | 0.848 | 0.409 | 0.409 | 0.828 |
+| UNet++ | focal | ✓ | 0.541 | 0.823 | 0.393 | 0.407 | 0.811 |
+| DeepLabV3+ | focal | ✓ | 0.500 | 0.739 | 0.378 | 0.383 | 0.737 |
+
+#### Best baseline — DeepLabV3+/ResNet-50, unified_focal + class weights
 
 | Class | IoU | F1 | Precision | Recall | Support (px) |
 |-------|-----|-----|-----------|--------|-------------|
-| Upland | _tbd_ | | | | |
-| Water | _tbd_ | | | | |
-| Emergent | _tbd_ | | | | |
-| **Mean IoU** | _tbd_ | | | | |
+| Upland (0) | 0.8707 | 0.9309 | 0.9532 | 0.9095 | 231,913,467 |
+| Water (1) | 0.5512 | 0.7107 | 0.7080 | 0.7133 | 40,038,240 |
+| Emergent (2) | 0.4807 | 0.6493 | 0.5990 | 0.7087 | 56,393,552 |
+| **Mean IoU** | **0.634** | | | | 328,345,259 |
+
+**Overall Accuracy**: 0.8511 | **Inference**: 219s on V100
+
+#### Key findings
+
+- **DeepLabV3+ > UNet++** across nearly all loss configs (+3–6 mIoU pts): ASPP captures
+  multi-scale spatial context better for diffuse emergent wetland patterns.
+- **unified_focal + class weights** is the best loss combo: Tversky component directly
+  optimises overlap for the minority emergent class vs focal-only which is unstable
+  (DeepLabV3+ + focal collapses to mIoU 0.500, over-predicts emergent recall=0.904).
+- **Emergent (0.481) remains the hard class** — spectrally similar to both Upland and Water
+  at 1m resolution; this is the target for WetMamba's depression-aware gating (§4.4).
+- **Water IoU 0.55** is limited by the 58% 2017 NAIP coverage creating temporal band gaps.
+- **WetMamba target**: must exceed mIoU **0.634** / Emergent IoU **0.481** to claim a
+  contribution over strong CNN baselines.
 
 ### 8.6 Limitations
 
