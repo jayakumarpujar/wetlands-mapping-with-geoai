@@ -118,6 +118,7 @@ class PrithviEncoder(nn.Module):
           4. torch.load Prithvi_EO_V2_300M.pt → inject weights manually
         """
         import importlib
+        import importlib.util
         import sys
         from pathlib import Path
 
@@ -130,10 +131,13 @@ class PrithviEncoder(nn.Module):
             local_files_only=True,
         )
 
-        # Import prithvi_mae to register 'prithvi_eo_v2_300' with timm
-        if snapshot_dir not in sys.path:
-            sys.path.insert(0, snapshot_dir)
-        importlib.import_module("prithvi_mae")
+        # Import prithvi_mae.py by explicit path to register prithvi_eo_v2_300 with timm.
+        # importlib.import_module("prithvi_mae") via sys.path is unreliable when
+        # snapshot_download returns a symlink-resolved path at runtime.
+        prithvi_mae_file = Path(snapshot_dir) / "prithvi_mae.py"
+        _spec = importlib.util.spec_from_file_location("prithvi_mae", prithvi_mae_file)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
 
         config = AutoConfig.from_pretrained(
             snapshot_dir,
