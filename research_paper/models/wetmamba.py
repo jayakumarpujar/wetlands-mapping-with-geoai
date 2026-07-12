@@ -98,6 +98,15 @@ class PrithviEncoder(nn.Module):
                 ) from e
             self._init_cnn_proxy()
 
+    @staticmethod
+    def _random_init_weights(m: nn.Module) -> None:
+        if hasattr(m, "reset_parameters"):
+            m.reset_parameters()
+        elif isinstance(m, (nn.Linear, nn.Conv2d, nn.Conv3d)):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
     def _init_prithvi(self) -> None:
         """Initialize Prithvi-EO-2.0 from HuggingFace with optional LoRA.
 
@@ -117,15 +126,17 @@ class PrithviEncoder(nn.Module):
             num_labels=3,
         )
 
-        if self._use_pretrained:
-            self.prithvi = AutoModel.from_pretrained(
-                self.model_name,
-                trust_remote_code=True,
-                config=config,
-            )
-        else:
-            # no_pretrained ablation: build Prithvi architecture with random weights
-            self.prithvi = AutoModel.from_config(config, trust_remote_code=True)
+        # Always use from_pretrained: registers prithvi_eo_v2_300 with timm
+        # (from_config skips remote code execution → timm never sees the arch)
+        self.prithvi = AutoModel.from_pretrained(
+            self.model_name,
+            trust_remote_code=True,
+            config=config,
+        )
+
+        if not self._use_pretrained:
+            # no_pretrained ablation: re-randomize all weights after load
+            self.prithvi.apply(self._random_init_weights)
 
         # Adapt input: our composite has input_channels bands → project to 6 HLS
         self.input_adapter = nn.Conv2d(
