@@ -126,10 +126,28 @@ class PrithviEncoder(nn.Module):
         from huggingface_hub import snapshot_download
         from transformers import AutoConfig, AutoModel
 
-        snapshot_dir = snapshot_download(
-            repo_id=self.model_name,
-            local_files_only=True,
-        )
+        # Pass cache_dir explicitly so path matches however the cache was populated.
+        # HF_HOME=$X puts hub cache at $X/hub/, but snapshot_download cache_dir=$X
+        # puts it at $X/ directly. We support both: try HF_HOME/hub first, fall
+        # back to HF_HOME itself.
+        import os
+        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        for _cache_dir in [hf_home, str(Path(hf_home) / "hub")]:
+            try:
+                snapshot_dir = snapshot_download(
+                    repo_id=self.model_name,
+                    cache_dir=_cache_dir,
+                    local_files_only=True,
+                )
+                if (Path(snapshot_dir) / "prithvi_mae.py").exists():
+                    break
+            except Exception:
+                continue
+        else:
+            raise FileNotFoundError(
+                f"prithvi_mae.py not found in HF cache under {hf_home}. "
+                "Re-run cache_prithvi.sh on the login node."
+            )
 
         # Import prithvi_mae.py by explicit path to register prithvi_eo_v2_300 with timm.
         # importlib.import_module("prithvi_mae") via sys.path is unreliable when
