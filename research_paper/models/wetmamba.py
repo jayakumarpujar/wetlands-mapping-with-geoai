@@ -108,34 +108,61 @@ class PrithviEncoder(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def _init_prithvi(self) -> None:
-        """Initialize Prithvi-EO-2.0 from HuggingFace with optional LoRA.
+        """Initialize Prithvi-EO-2.0 from HuggingFace cache.
 
-        Prithvi-EO-2.0 expects input shape (B, C=6, T, H, W). We set
-        num_frames=1 (temporal fusion handled externally by TemporalSSMFusion)
-        and adapt our multi-band input to 6 HLS channels via a 1×1 conv.
-
-        num_labels=3 overrides the null stored in Prithvi's config.json which
-        causes range(None) → TypeError in TimmWrapperConfig.__post_init__.
+        Strategy: Prithvi stores weights as Prithvi_EO_V2_300M.pt (non-standard).
+        AutoModel.from_pretrained can't find them. We instead:
+          1. snapshot_download → get local cache path
+          2. import prithvi_mae.py → registers prithvi_eo_v2_300 with timm
+          3. AutoModel.from_config → build arch (timm now knows it)
+          4. torch.load Prithvi_EO_V2_300M.pt → inject weights manually
         """
+        import importlib
+        import sys
+        from pathlib import Path
+
+        import torch
+        from huggingface_hub import snapshot_download
         from transformers import AutoConfig, AutoModel
 
+        snapshot_dir = snapshot_download(
+            repo_id=self.model_name,
+            local_files_only=True,
+        )
+
+        # Import prithvi_mae to register 'prithvi_eo_v2_300' with timm
+        if snapshot_dir not in sys.path:
+            sys.path.insert(0, snapshot_dir)
+        importlib.import_module("prithvi_mae")
+
         config = AutoConfig.from_pretrained(
-            self.model_name,
+            snapshot_dir,
             trust_remote_code=True,
             num_frames=1,
             num_labels=3,
+            local_files_only=True,
         )
 
-        # Always use from_pretrained: registers prithvi_eo_v2_300 with timm
-        # (from_config skips remote code execution → timm never sees the arch)
-        self.prithvi = AutoModel.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-            config=config,
-        )
+        # Build architecture (timm arch now registered via prithvi_mae import)
+        self.prithvi = AutoModel.from_config(config, trust_remote_code=True)
 
-        if not self._use_pretrained:
-            # no_pretrained ablation: re-randomize all weights after load
+        if self._use_pretrained:
+            weights_path = Path(snapshot_dir) / "Prithvi_EO_V2_300M.pt"
+            state_dict = torch.load(weights_path, map_location="cpu")
+            # Checkpoint may wrap weights under 'model' key
+            if isinstance(state_dict, dict) and "model" in state_dict:
+                state_dict = state_dict["model"]
+            missing, unexpected = self.prithvi.load_state_dict(
+                state_dict, strict=False
+            )
+            import logging
+            _log = logging.getLogger(__name__)
+            if missing:
+                _log.warning("Prithvi: %d missing keys (encoder-only is normal)", len(missing))
+            if unexpected:
+                _log.warning("Prithvi: %d unexpected keys", len(unexpected))
+        else:
+            # no_pretrained ablation: architecture with random weights
             self.prithvi.apply(self._random_init_weights)
 
         # Adapt input: our composite has input_channels bands → project to 6 HLS
