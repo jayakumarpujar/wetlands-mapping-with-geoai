@@ -94,15 +94,29 @@ def evaluate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}", flush=True)
 
-    model = smp.create_model(
-        architecture,
-        encoder_name=encoder_name,
-        encoder_weights=None,
-        in_channels=in_channels,
-        classes=num_classes,
-    )
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    model.load_state_dict(state_dict)
+    if architecture == "wetmamba":
+        import sys as _sys
+        from pathlib import Path as _Path
+        _repo = _Path(__file__).resolve().parents[1]
+        if str(_repo) not in _sys.path:
+            _sys.path.insert(0, str(_repo))
+        from research_paper.models.wetmamba import WetMamba
+        model = WetMamba(
+            input_channels=in_channels,
+            num_classes=num_classes,
+        )
+        state_dict = torch.load(model_path, map_location=device, weights_only=False)
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        model = smp.create_model(
+            architecture,
+            encoder_name=encoder_name,
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=num_classes,
+        )
+        state_dict = torch.load(model_path, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
