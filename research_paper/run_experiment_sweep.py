@@ -468,10 +468,17 @@ def main() -> None:
         help="Run CNN baseline runs only (skip WetMamba runs).",
     )
     parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Override num_epochs in FIXED_HPARAMS (e.g. 60 for ablations).",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="DEBUG-level logging.",
     )
     args = parser.parse_args()
+
+    if args.epochs is not None:
+        FIXED_HPARAMS["num_epochs"] = args.epochs
 
     # Ensure repo root is on sys.path (handles running as a script)
     repo_root = str(Path(__file__).resolve().parent.parent)
