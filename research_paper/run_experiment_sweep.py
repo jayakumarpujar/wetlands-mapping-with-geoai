@@ -125,9 +125,11 @@ LOSS_CONFIGS = [
 # ---------------------------------------------------------------------------
 
 FIXED_HPARAMS = {
-    "learning_rate": 3e-4,
+    "learning_rate": 1e-4,
     "weight_decay": 1e-4,
     "num_epochs": 100,
+    "lora_rank": 16,
+    "warmup_epochs": 10,
     "batch_size": 32,
     "val_split": 0.2,
     "num_classes": 3,
@@ -311,6 +313,8 @@ def train_wetmamba(
         batch_size=8,  # V100 32GB — Prithvi-300M needs smaller batch
         lr=FIXED_HPARAMS["learning_rate"],
         weight_decay=FIXED_HPARAMS["weight_decay"],
+        lora_rank=FIXED_HPARAMS["lora_rank"],
+        warmup_epochs=FIXED_HPARAMS["warmup_epochs"],
         loss_function=run.loss_function,
         use_class_weights=run.use_class_weights,
         ignore_index=FIXED_HPARAMS["ignore_index"],

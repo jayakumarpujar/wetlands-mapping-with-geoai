@@ -92,7 +92,8 @@ class TrainConfig:
     ufl_gamma: float = 0.75
     ufl_delta: float = 0.6
     scheduler: str = "cosine"
-    warmup_epochs: int = 5
+    warmup_epochs: int = 10
+    lora_rank: int = 16
     num_workers: int = 4
 
     # Data
@@ -540,6 +541,9 @@ def train(config: TrainConfig) -> Dict[str, Any]:
     model_kwargs: Dict[str, Any] = {}
     if config.ablation and config.ablation in ABLATION_VARIANTS:
         model_kwargs.update(ABLATION_VARIANTS[config.ablation])
+
+    if config.model_name == "wetmamba":
+        model_kwargs.setdefault("lora_rank", config.lora_rank)
 
     model = build_model(
         config.model_name,
