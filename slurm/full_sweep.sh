@@ -18,7 +18,7 @@ TEST=/home/john_lab/shared/Jay/wetlands_testdata
 SWEEP_OUT=/home/john_lab/shared/Jay/wetlands_data/sweep
 HF_CACHE=/home/john_lab/shared/Jay/hf_cache
 
-export HF_HOME=$HF_CACHE
+export HF_HOME=/home/john_lab/shared/Jay/hf_cache
 export TRANSFORMERS_OFFLINE=1
 export PYTHONUNBUFFERED=1
 
@@ -41,6 +41,8 @@ python research_paper/run_experiment_sweep.py \
     --train-tiles $DATA/tiles \
     --test-tiles  $TEST/tiles \
     --output-root $SWEEP_OUT \
+    --wetmamba-only \
+    --epochs 60 \
     --num-workers 4 \
     -v
 
